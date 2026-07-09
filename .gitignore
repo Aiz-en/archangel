@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables / secrets
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Project
+*.db
+*.sqlite
+*.log
+logs/
+conf/
+
+# Webull unofficial library — auth/device state and cached credentials
+did.bin
+webull_credentials.json
+*.token
