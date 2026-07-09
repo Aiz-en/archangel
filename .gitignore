@@ -30,3 +30,7 @@ conf/
 did.bin
 webull_credentials.json
 *.token
+
+# Local LLM instructions (not part of the public project)
+CLAUDE.md
+.claude/
