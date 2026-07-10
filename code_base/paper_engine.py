@@ -198,6 +198,31 @@ class Portfolio:
             )
         )
 
+    def close_position_at(
+        self, symbol: str, price: float, ts: datetime, reason: str
+    ) -> Optional[ClosedTrade]:
+        """Force-close an open position at `price` (e.g. end-of-day flatten).
+
+        Returns the resulting ClosedTrade, or None if no position is open.
+        """
+        if symbol not in self.positions:
+            return None
+        self._close_position(symbol, price, ts, reason)
+        return self.closed_trades[-1]
+
+    def cancel_pending(self, symbol: Optional[str] = None) -> list[Order]:
+        """Cancel pending orders (all of them, or just `symbol`'s). Returns them."""
+        canceled: list[Order] = []
+        still_pending: list[Order] = []
+        for order in self.pending_orders:
+            if symbol is None or order.symbol == symbol:
+                order.status = OrderStatus.CANCELED
+                canceled.append(order)
+            else:
+                still_pending.append(order)
+        self.pending_orders = still_pending
+        return canceled
+
 
 def _smoke_test() -> int:
     """Walk through a small scenario end-to-end so we can eyeball the engine."""

@@ -100,7 +100,8 @@ class ScreenResult:
     candidates: list[Candidate]
     gainers_scanned: int = 0
     enriched: int = 0
-    dropped: int = 0
+    dropped: int = 0          # failed the float/RVOL criteria
+    dropped_missing: int = 0  # couldn't be evaluated (enrichment data missing)
 
 
 # --- per-day enrichment cache --------------------------------------------
@@ -139,8 +140,12 @@ def enrich(symbol: str, today: Optional[date] = None) -> tuple[Optional[float], 
 
     float_shares, avg_volume, market_cap = _fetch_fundamentals(symbol)
 
-    with _cache_lock:
-        _enrich_cache[symbol] = (today, float_shares, avg_volume, market_cap)
+    # A total miss is a transient failure (rate limit, outage), not a fact about
+    # the symbol — caching it would blacklist the symbol until tomorrow. Leave
+    # it uncached so the next refresh retries.
+    if not (float_shares is None and avg_volume is None and market_cap is None):
+        with _cache_lock:
+            _enrich_cache[symbol] = (today, float_shares, avg_volume, market_cap)
     return float_shares, avg_volume, market_cap
 
 
@@ -179,19 +184,22 @@ def screen_once(
     fundamentals: dict[str, tuple[Optional[float], Optional[float], Optional[float]]] = {}
     if coarse:
         symbols = [m.symbol for m in coarse]
-        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
+        # Modest concurrency: a burst of 8 first-sight .info calls at the open
+        # is exactly how we trip Yahoo rate limits.
+        with ThreadPoolExecutor(max_workers=min(4, len(symbols))) as pool:
             results = pool.map(lambda s: enrich(s, today=today), symbols)
         fundamentals = dict(zip(symbols, results))
 
     candidates: list[Candidate] = []
     dropped = 0
+    dropped_missing = 0
     for m in coarse:
         float_shares, avg_volume, market_cap = fundamentals[m.symbol]
         rvol = m.volume / avg_volume if avg_volume else None
 
         if float_shares is None or rvol is None:
             if criteria.drop_on_missing_data:
-                dropped += 1
+                dropped_missing += 1
                 continue
         if float_shares is not None and float_shares > criteria.max_float:
             dropped += 1
@@ -220,6 +228,7 @@ def screen_once(
         gainers_scanned=len(movers),
         enriched=len(coarse),
         dropped=dropped,
+        dropped_missing=dropped_missing,
     )
 
 
@@ -241,9 +250,9 @@ def render_table(result: ScreenResult, criteria: ScreenCriteria, clear: bool = T
     if not result.candidates:
         lines.append(f" {'— no candidates meet criteria —':^{width - 2}}")
     for c in result.candidates:
-        float_m = f"{c.float_shares / 1e6:.1f}" if c.float_shares else "?"
-        rvol = f"{c.rvol:.1f}x" if c.rvol else "?"
-        mktcap = f"{c.market_cap / 1e6:.0f}M" if c.market_cap else "?"
+        float_m = f"{c.float_shares / 1e6:.1f}" if c.float_shares is not None else "?"
+        rvol = f"{c.rvol:.1f}x" if c.rvol is not None else "?"
+        mktcap = f"{c.market_cap / 1e6:.0f}M" if c.market_cap is not None else "?"
         lines.append(
             f" {c.symbol:<7} {c.pct_change:>+7.1f}% {c.last_price:>8.2f} "
             f"{c.volume:>14,} {float_m:>9} {rvol:>9} {mktcap:>9}"
@@ -253,6 +262,7 @@ def render_table(result: ScreenResult, criteria: ScreenCriteria, clear: bool = T
         f" {len(result.candidates)} candidate(s)  |  "
         f"{result.gainers_scanned} gainers scanned, "
         f"{result.enriched} priced-in, {result.dropped} dropped"
+        + (f", {result.dropped_missing} missing data" if result.dropped_missing else "")
     )
     lines.append("=" * width)
 
@@ -299,6 +309,17 @@ class LiveScreener:
         self._watchlist = result.candidates  # atomic rebind
         return result
 
+    def _refresh_safely(self) -> Optional[ScreenResult]:
+        """refresh(), but a transient failure logs and returns None instead of
+        killing a session-long loop. Both run() and start() poll through this
+        so their error behavior can't drift apart. The previous watchlist is
+        kept on failure — briefly-stale candidates beat an empty list."""
+        try:
+            return self.refresh()
+        except Exception as exc:
+            print(f"[screener] refresh error: {exc}", file=sys.stderr, flush=True)
+            return None
+
     def run(self, render: bool = True) -> None:
         """Blocking poll loop until interrupted (Ctrl-C) or `stop()`."""
         self._stop.clear()
@@ -313,8 +334,8 @@ class LiveScreener:
                     )
                     self._stop.wait(self.refresh_seconds)
                     continue
-                result = self.refresh()
-                if render:
+                result = self._refresh_safely()
+                if result is not None and render:
                     print(render_table(result, self.criteria), flush=True)
                 self._stop.wait(self.refresh_seconds)
         except KeyboardInterrupt:
@@ -328,10 +349,7 @@ class LiveScreener:
         def _loop() -> None:
             while not self._stop.is_set():
                 if not self.respect_market_hours or is_market_open():
-                    try:
-                        self.refresh()
-                    except Exception as exc:  # keep the daemon alive on transient errors
-                        print(f"[screener] refresh error: {exc}", file=sys.stderr, flush=True)
+                    self._refresh_safely()
                 self._stop.wait(self.refresh_seconds)
 
         self._stop.clear()
