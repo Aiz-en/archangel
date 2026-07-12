@@ -48,7 +48,7 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as time_of_day
 from threading import Event
 from typing import Any, Callable, Optional, Union
@@ -164,6 +164,8 @@ class LiveRunner:
         self._last_processed: dict[str, pd.Timestamp] = {}
         self._last_close: dict[str, float] = {}
         self._watchlist_symbols: list[str] = []
+        self._watched_today: set[str] = set()
+        self._session_date: Optional[date] = None
         self._trades_logged = 0
         self._stop = Event()
         if self.trade_log is not None:
@@ -271,6 +273,7 @@ class LiveRunner:
         except Exception as exc:
             report.errors.append(f"screener: {exc}")
         report.watchlist = list(self._watchlist_symbols)
+        self._watched_today.update(self._watchlist_symbols)
 
         # 2. Expire stale entry orders before processing new bars.
         ttl = timedelta(minutes=self.entry_ttl_minutes)
@@ -468,10 +471,20 @@ class LiveRunner:
             print(f"[runner] persist during {where} failed: {exc}",
                   file=sys.stderr, flush=True)
 
+    def _write_daily_summary(self) -> None:
+        """One permanent row for this session day — even a zero-trade day
+        leaves a record that the bot ran and what it watched."""
+        if self.trade_log is None or self._session_date is None:
+            return
+        self.trade_log.record_daily_summary(
+            self._session_date, self.portfolio, self._last_close,
+            sorted(self._watched_today),
+        )
+
     def run(self) -> None:
         """Blocking poll loop until Ctrl-C or stop()."""
         self._stop.clear()
-        session_date = datetime.now(_ET).date()
+        self._session_date = datetime.now(_ET).date()
         print(
             f"Live runner up [{self.criteria.describe()}] — "
             f"${self.position_size_usd:g}/position, max {self.max_concurrent}, "
@@ -482,19 +495,27 @@ class LiveRunner:
         try:
             while not self._stop.is_set():
                 now = datetime.now(_ET)
-                if now.date() != session_date:
+                if now.date() != self._session_date:
                     # Slept through midnight (laptop lid closed mid-session).
                     # Yesterday's session is over — never carry its positions
                     # into a new day, and never let a stale process quietly
-                    # become today's runner.
+                    # become today's runner. (Rollover-flatten exits land on
+                    # the new day's timestamps; the summary row records the
+                    # session day's DB state.)
                     if self.eod_flatten is not None:
                         self._flatten_all_and_persist(now, "day rollover")
+                    try:
+                        self._write_daily_summary()
+                    except Exception as exc:
+                        print(f"[runner] rollover summary failed: {exc}",
+                              file=sys.stderr, flush=True)
                     if self.exit_after_close:
                         print(f"[{now:%H:%M:%S} ET] New day — exiting "
                               f"(--exit-after-close); launchd starts fresh.",
                               flush=True)
                         break
-                    session_date = now.date()
+                    self._session_date = now.date()
+                    self._watched_today.clear()
                 if self.respect_market_hours and not is_market_open():
                     if self.exit_after_close and (
                         not is_trading_day(now.date())
@@ -542,6 +563,11 @@ class LiveRunner:
             self._persist(datetime.now(_ET))
         except Exception as exc:
             print(f"[runner] final persist failed: {exc}",
+                  file=sys.stderr, flush=True)
+        try:
+            self._write_daily_summary()
+        except Exception as exc:
+            print(f"[runner] daily summary failed: {exc}",
                   file=sys.stderr, flush=True)
         open_syms = list(self.portfolio.positions)
         print(
@@ -715,6 +741,36 @@ def _smoke_test() -> int:
             failures += 1
     finally:
         Path(state_db).unlink(missing_ok=True)
+
+    # Daily summary: a zero-trade session still leaves a permanent row at
+    # shutdown, and a re-write for the same day replaces rather than dupes.
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        summary_db = f.name
+    try:
+        log6 = TradeLog(db_path=summary_db)
+        pf6 = Portfolio(cash=5_000.0)
+        runner6 = LiveRunner(portfolio=pf6, trade_log=log6, bar_fetcher=fetcher,
+                             screen=fake_screen, respect_market_hours=False,
+                             eod_flatten=None)
+        runner6._session_date = day.date()
+        runner6._watched_today = {"FAKE"}
+        runner6._shutdown()
+        runner6._shutdown()  # second write must replace, not duplicate
+        rows = log6.daily_summaries()
+        ok = (
+            len(rows) == 1
+            and rows[0][0] == day.date().isoformat()
+            and rows[0][1] == 0                 # zero trades, row exists anyway
+            and abs(rows[0][3] - 5_000.0) < 1e-9
+            and rows[0][4] == "FAKE"
+        )
+        if ok:
+            print("PASS daily-summary: zero-trade day recorded once at shutdown")
+        else:
+            print(f"FAIL daily-summary: rows={rows}", file=sys.stderr)
+            failures += 1
+    finally:
+        Path(summary_db).unlink(missing_ok=True)
 
     if failures:
         print(f"\n{failures} failure(s)", file=sys.stderr)

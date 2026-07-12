@@ -17,7 +17,7 @@ import sqlite3
 import sys
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS open_positions (
 CREATE TABLE IF NOT EXISTS runner_state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_summary (
+    day            TEXT    PRIMARY KEY,
+    trades         INTEGER NOT NULL,
+    realized_pnl   REAL    NOT NULL,
+    ending_equity  REAL    NOT NULL,
+    ending_cash    REAL    NOT NULL,
+    watched        TEXT    NOT NULL,
+    recorded_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_symbol     ON closed_trades(symbol);
@@ -217,6 +227,49 @@ class TradeLog:
             return conn.execute(
                 """SELECT symbol, entry_price, exit_price, pnl, exit_reason, exit_time
                 FROM closed_trades ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+    def record_daily_summary(
+        self,
+        day: "date",
+        portfolio: Portfolio,
+        marks: dict[str, float],
+        watched: list[str],
+    ) -> None:
+        """One row per session day — written even on zero-trade days, so
+        'ran and declined to trade' stays distinguishable from 'never ran'.
+
+        Trade count and P&L are re-derived from closed_trades for `day`
+        (not from the in-memory run), so a crash + same-day restart still
+        produces correct full-day numbers at the final write. INSERT OR
+        REPLACE means the last write of the day wins."""
+        with self._connect() as conn:
+            count, pnl = conn.execute(
+                """SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM closed_trades
+                   WHERE date(exit_time) = ?""",
+                (day.isoformat(),),
+            ).fetchone()
+            conn.execute(
+                """INSERT OR REPLACE INTO daily_summary
+                (day, trades, realized_pnl, ending_equity, ending_cash, watched)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    day.isoformat(),
+                    count,
+                    pnl,
+                    portfolio.equity(marks),
+                    portfolio.cash,
+                    ",".join(watched),
+                ),
+            )
+
+    def daily_summaries(self, limit: int = 30) -> list[tuple]:
+        """(day, trades, realized_pnl, ending_equity, watched), newest first."""
+        with self._connect() as conn:
+            return conn.execute(
+                """SELECT day, trades, realized_pnl, ending_equity, watched
+                   FROM daily_summary ORDER BY day DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
 
