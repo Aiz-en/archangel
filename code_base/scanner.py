@@ -26,6 +26,17 @@ import sys
 from dataclasses import dataclass
 
 
+class ScannerFeedError(RuntimeError):
+    """The Webull gainers feed returned something we can't trust.
+
+    Raised instead of silently returning [] — for a trading bot, "the feed
+    broke" must look different from "no movers today", or the operator
+    watches a healthy-looking screen that is actually blind. Polling callers
+    (the screener) catch this and keep their previous watchlist; one-shot
+    callers crash loudly, which is the point.
+    """
+
+
 @dataclass
 class Mover:
     symbol: str
@@ -61,26 +72,52 @@ class WebullScanner:
         raw = self._wb.active_gainer_loser(
             direction="gainer", rank_type=rank_type, count=max_results
         )
+        if not isinstance(raw, dict) or "data" not in raw:
+            raise ScannerFeedError(
+                "gainers feed shape changed: expected a dict with 'data', got "
+                f"{type(raw).__name__}"
+                + (f" with keys {sorted(raw)[:8]}" if isinstance(raw, dict) else "")
+            )
+        if raw["data"] is not None and not isinstance(raw["data"], list):
+            raise ScannerFeedError(
+                f"gainers feed 'data' is {type(raw['data']).__name__}, expected a list"
+            )
+        entries = raw["data"] or []
+        if not entries:
+            # The feed returns the top N gainers regardless of magnitude — on a
+            # trading day it is never truly empty. Empty means blocked/broken.
+            raise ScannerFeedError(
+                "gainers feed returned zero entries — treating as a feed failure, "
+                "not a quiet market"
+            )
+
         movers: list[Mover] = []
-        for entry in raw.get("data", []):
+        parse_failures = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                parse_failures += 1
+                continue
             ticker = entry.get("ticker", {})
             try:
                 pct = float(ticker["changeRatio"]) * 100
+                symbol = ticker["symbol"]
+                last_price = float(ticker["close"])
+                volume = int(ticker["volume"])
             except (KeyError, ValueError, TypeError):
+                parse_failures += 1
                 continue
             if pct < min_pct_change:
                 continue
-            try:
-                movers.append(
-                    Mover(
-                        symbol=ticker["symbol"],
-                        pct_change=pct,
-                        last_price=float(ticker["close"]),
-                        volume=int(ticker["volume"]),
-                    )
-                )
-            except (KeyError, ValueError, TypeError):
-                continue
+            movers.append(
+                Mover(symbol=symbol, pct_change=pct, last_price=last_price, volume=volume)
+            )
+        if parse_failures == len(entries):
+            first = entries[0]
+            sample = first.get("ticker", first) if isinstance(first, dict) else first
+            raise ScannerFeedError(
+                f"gainers feed parsed 0/{len(entries)} entries — ticker schema "
+                f"changed? sample keys: {sorted(sample)[:10] if isinstance(sample, dict) else sample!r}"
+            )
         return movers
 
 

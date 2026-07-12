@@ -13,14 +13,15 @@ mode** against real market data with locally simulated fills.
 ## How it works
 
 ```
-  scanner.py / screener.py     candidate symbols (today the backtest feeds
-            │                  from the raw gainer feed; wiring the live
-            ▼                  watchlist into a real-time loop is next)
-        runner.py  ◀────────── yfinance 1m/5m bars
-            │
-            ├──▶ strategy.py      bull-flag detection + 9 EMA trigger
-            ├──▶ paper_engine.py  simulated fills, positions, P&L
-            └──▶ storage.py       SQLite trade log
+  scanner.py ──▶ screener.py       candidate symbols — the same full
+                      │            selection screen feeds the backtest
+                      ▼            and the live runner
+   runner.py (historical walk)
+   live_runner.py (real-time loop) ◀── yfinance 1m/5m bars
+                      │
+                      ├──▶ strategy.py      bull-flag detection + 9 EMA trigger
+                      ├──▶ paper_engine.py  simulated fills, positions, P&L
+                      └──▶ storage.py       SQLite trade log
 ```
 
 1. **Screen** — `screener.py` polls Webull's top-gainers feed and keeps a live
@@ -39,9 +40,11 @@ mode** against real market data with locally simulated fills.
 5. **Record** — `storage.py` persists every closed trade and equity snapshot to
    SQLite for later analysis.
 
-`runner.py` is the glue that walks bars in time order and ties these stages
-together. Today it runs over recent history through the backtest harness; the
-real-time polling loop is the next milestone.
+Two runners drive these stages: `runner.py` walks a fixed span of recent
+history (the backtest path), and `live_runner.py` polls the market in real
+time during trading hours — screening, entering, managing stops/take-profits,
+force-flattening everything at 3:55pm ET, and surviving crashes by resuming
+its same-day positions from SQLite on restart.
 
 The full strategy specification lives in
 [docs/trading_strategy_baseline.md](docs/trading_strategy_baseline.md).
@@ -89,6 +92,18 @@ python code_base/screener.py --min-change 30 --ignore-hours   # looser, after ho
 python code_base/screener.py --help         # every criterion has a flag
 ```
 
+**Live paper trading** — polls every 30s during market hours, trades the
+watchlist with simulated fills, flattens at 3:55pm ET, logs to
+`archangel_live.db`:
+
+```bash
+python code_base/live_runner.py            # the real thing (idles off-hours)
+python code_base/live_runner.py --smoke    # offline self-test, no network
+python code_base/live_runner.py --once --replay-today --db test.db
+                                           # replay recent days through the
+                                           # exact live code path
+```
+
 **Raw top-gainers scan:**
 
 ```bash
@@ -97,8 +112,10 @@ python code_base/scanner.py
 
 **Backtest recent movers** — two sweeps (today's +70% intraday gainers, then the
 past 5 days' +100% movers) over recent 1m/5m bars, printing win rate, expectancy,
-and drawdown for each. Writes `archangel_backtest_*.db` scratch files to the
-working directory; on quiet days a sweep may find no qualifying movers:
+and drawdown for each. Candidates pass the same full screen the live runner
+trades (the 5-day sweep relaxes the today-anchored volume/RVOL filters). Writes
+`archangel_backtest_*.db` scratch files to the working directory; on quiet days
+a sweep may find no qualifying movers:
 
 ```bash
 python code_base/backtest.py
@@ -111,6 +128,7 @@ Most modules also run standalone as smoke tests, e.g.
 
 ```
 code_base/
+  live_runner.py   # real-time polling loop: screen, enter, manage, flatten
   screener.py      # live multi-criteria watchlist (the selection rules)
   scanner.py       # raw Webull top-gainers feed
   strategy.py      # bull-flag detection + 9 EMA trigger (pure functions)
@@ -128,15 +146,15 @@ docs/              # strategy spec + Webull API research
 
 ## Status & roadmap
 
-Working today: screening, detection, simulated fills, SQLite logging, and a
-multi-symbol backtest harness. Early backtest samples are far too small to draw
-conclusions from.
+Working today: screening, detection, simulated fills, SQLite logging, a
+multi-symbol backtest harness, and a hardened real-time paper-trading loop
+(crash recovery, feed-failure tripwires, end-of-day flatten). Live and
+backtest samples are still far too small to draw conclusions from.
 
 Next up:
 
-- Live polling runner: poll bars during market hours, trade the watchlist in real
-  time against a Webull paper account
-- Order placement through the paper broker (currently read-only)
+- Order placement through the Webull paper broker (currently read-only), so
+  live-runner fills hit a real paper account instead of the local simulator
 - Historical movers source, so backtests can cover more than the last ~7 days
 - Time-interleaved backtesting (currently sequential per symbol)
 

@@ -1,8 +1,12 @@
 """Backtest harness: run the strategy across multiple symbols and report stats.
 
-Pulls today's +70% movers from the scanner, runs the strategy on each
-across the configured period (default 5d, the yfinance 1m-bar limit),
-and reports aggregate stats from the SQLite trade log.
+Candidates come from the SAME full screen the live runner trades
+(screener.screen_once: %change, $1-20 price band, >=1M volume, float
+<=20M, RVOL >=5x) — not just the raw %change feed. If the backtest
+selected symbols the live bot would never trade, its stats couldn't
+validate live behavior. Each sweep then runs the strategy across the
+configured period (default 5d, the yfinance 1m-bar limit) and reports
+aggregate stats from the SQLite trade log.
 
 Important caveat — sequential vs time-interleaved:
 This harness walks symbols *one after another* with a shared portfolio.
@@ -29,7 +33,7 @@ from typing import Any, Optional
 
 from paper_engine import Portfolio
 from runner import fetch_and_run
-from scanner import WebullScanner
+from screener import ScreenCriteria, screen_once
 from storage import TradeLog
 
 
@@ -120,14 +124,33 @@ def _run_one_sweep(label: str, rank_type: str, threshold: float, max_results: in
     log = TradeLog(db_path=db_path)
 
     print(f"\n========== Sweep: {label} (rank_type={rank_type}, >= +{threshold}%) ==========")
-    movers = WebullScanner().get_top_gainers(
-        min_pct_change=threshold, max_results=max_results, rank_type=rank_type
+    # Full live screen, not just the %change feed — see module docstring.
+    if rank_type == "1d":
+        criteria = ScreenCriteria(min_pct_change=threshold, rank_type=rank_type)
+    else:
+        # Volume and RVOL are anchored to TODAY's session. A stock that pumped
+        # three days ago and is quiet today fails them — yet its pump-day bars
+        # are exactly what this sweep walks. Keep the day-stable filters
+        # (price band, float); drop the today-anchored ones. Faithful
+        # as-of-pump-day screening needs historical volume data
+        # (future find_historical_movers).
+        criteria = ScreenCriteria(
+            min_pct_change=threshold, rank_type=rank_type,
+            min_volume=0, min_rvol=0.0,
+        )
+    result = screen_once(criteria, max_results=max_results)
+    coarse_dropped = result.gainers_scanned - result.enriched
+    print(
+        f"{result.gainers_scanned} gainers above +{threshold:g}% -> "
+        f"{len(result.candidates)} passed the full screen "
+        f"({coarse_dropped} price/volume-filtered, {result.dropped} float/RVOL-filtered, "
+        f"{result.dropped_missing} missing data)"
     )
-    if not movers:
-        print(f"No movers found above +{threshold}% on {rank_type} ranking.")
+    if not result.candidates:
+        print(f"No candidates passed the full screen on {rank_type} ranking.")
         return
 
-    symbols = [m.symbol for m in movers]
+    symbols = [c.symbol for c in result.candidates]
     print(f"Backtesting {len(symbols)} symbols: {symbols}\n")
 
     result = backtest(symbols, pf, period="5d", trade_log=log)

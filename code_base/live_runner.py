@@ -160,6 +160,74 @@ class LiveRunner:
         self._watchlist_symbols: list[str] = []
         self._trades_logged = 0
         self._stop = Event()
+        if self.trade_log is not None:
+            self._rehydrate()
+
+    def _rehydrate(self) -> None:
+        """Resume same-day open positions after a crash or restart.
+
+        Positions saved on a PREVIOUS day are ignored (with a loud note): they
+        were either flattened at that day's close, or the crash predates the
+        flatten and the position is unrecoverable as a live concern. Exits for
+        a resumed position are evaluated on bars from restart onward — a stop
+        breached only during the outage (V-shaped dip) is missed; one that's
+        still breached triggers on the next processed bar.
+        """
+        try:
+            cash, positions, saved_at = self.trade_log.load_portfolio_state()
+        except Exception as exc:
+            print(f"[runner] saved-state load failed ({exc}); starting fresh.",
+                  file=sys.stderr, flush=True)
+            return
+        if saved_at is None:
+            return
+        now = datetime.now(_ET)
+        if saved_at.astimezone(_ET).date() != now.date():
+            if positions:
+                print(
+                    f"[runner] ignoring saved state from {saved_at:%Y-%m-%d} — "
+                    f"{len(positions)} position(s) from a previous session NOT restored.",
+                    file=sys.stderr, flush=True,
+                )
+            return
+
+        # Same-day: cash always comes back — realized P&L must survive a
+        # restart even when flat, or the session's equity record tears.
+        if cash is not None:
+            self.portfolio.cash = cash
+        if not positions:
+            print(f"[runner] resumed flat same-day state, cash ${self.portfolio.cash:.2f}",
+                  flush=True)
+            return
+        for pos in positions:
+            self.portfolio.positions[pos.symbol] = pos
+
+        # Restored past the flatten deadline: cycle() may never run again
+        # today (market-hours idle), so flatten NOW or the position gets
+        # carried overnight — the one thing this bot must never do. No market
+        # price is available yet, so close neutrally at entry price.
+        if self.eod_flatten is not None and now.time() >= self.eod_flatten:
+            for symbol in list(self.portfolio.positions):
+                pos = self.portfolio.positions[symbol]
+                self.portfolio.close_position_at(symbol, pos.entry_price, now, "eod_flatten")
+            try:
+                self._flush_trade_log(now)
+                self.trade_log.save_portfolio_state(self.portfolio, now)
+            except Exception as exc:
+                print(f"[runner] post-deadline flatten persist failed: {exc}",
+                      file=sys.stderr, flush=True)
+            print(
+                f"[runner] restored {len(positions)} position(s) past the "
+                f"{self.eod_flatten:%H:%M} flatten deadline — closed at entry price, "
+                f"NOT carried overnight.", flush=True,
+            )
+            return
+
+        print(
+            f"[runner] resumed same-day state: {len(positions)} open position(s) "
+            f"({', '.join(p.symbol for p in positions)}), cash ${self.portfolio.cash:.2f}",
+            flush=True,
+        )
 
     # -- one poll cycle ----------------------------------------------------
 
@@ -234,6 +302,11 @@ class LiveRunner:
             self._flush_trade_log(now)
         except Exception as exc:
             report.errors.append(f"trade-log: {type(exc).__name__}: {exc}")
+        try:
+            if self.trade_log is not None:
+                self.trade_log.save_portfolio_state(self.portfolio, now)
+        except Exception as exc:
+            report.errors.append(f"state-save: {type(exc).__name__}: {exc}")
         return report
 
     def _flush_trade_log(self, now: datetime) -> None:
@@ -398,11 +471,21 @@ class LiveRunner:
 
     def _shutdown(self) -> None:
         # Ctrl-C can land mid-cycle, after a trade closed but before step 5
-        # persisted it — flush the high-water mark so the DB never loses one.
+        # persisted it — flush the high-water mark so the DB never loses one,
+        # AND re-save the position snapshot so it agrees with the flushed
+        # trades. Flushing without saving would leave the DB claiming an
+        # already-closed position is still open; a same-day restart would then
+        # resurrect it and double-count the trade.
         try:
             self._flush_trade_log(datetime.now(_ET))
         except Exception as exc:
             print(f"[runner] final trade-log flush failed: {exc}",
+                  file=sys.stderr, flush=True)
+        try:
+            if self.trade_log is not None:
+                self.trade_log.save_portfolio_state(self.portfolio, datetime.now(_ET))
+        except Exception as exc:
+            print(f"[runner] final state save failed: {exc}",
                   file=sys.stderr, flush=True)
         open_syms = list(self.portfolio.positions)
         print(
@@ -439,7 +522,9 @@ def _smoke_test() -> int:
     from ema import add_ema
 
     failures = 0
-    day = datetime(2026, 7, 9, tzinfo=_ET)
+    # Fixture times are anchored to today so the same-day rehydrate check in
+    # the restart case is exercised for real.
+    day = datetime.now(_ET).replace(hour=0, minute=0, second=0, microsecond=0)
 
     def bars_1m_raw() -> pd.DataFrame:
         # 09:30-09:44: runway at ~95 while the 5m flag is still forming (no
@@ -543,6 +628,37 @@ def _smoke_test() -> int:
         print(f"FAIL: expected eod_flatten close + entry lockout, got "
               f"{pf3.closed_trades} entries={late.entries_submitted}", file=sys.stderr)
         failures += 1
+
+    # Restart recovery: open a position with state persistence, "crash", then
+    # a fresh runner on the same DB must resume the position and cash.
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        state_db = f.name
+    try:
+        pf4 = Portfolio(cash=5_000.0)
+        runner4 = LiveRunner(portfolio=pf4, trade_log=TradeLog(db_path=state_db),
+                             bar_fetcher=fetcher, screen=fake_screen,
+                             replay_today=True, respect_market_hours=False,
+                             tp_pct=10.0, eod_flatten=None)
+        runner4.cycle(now=day.replace(hour=10, minute=0))
+        crashed_with_position = "FAKE" in pf4.positions
+
+        pf5 = Portfolio(cash=5_000.0)  # fresh process, default cash
+        LiveRunner(portfolio=pf5, trade_log=TradeLog(db_path=state_db),
+                   bar_fetcher=fetcher, screen=fake_screen,
+                   respect_market_hours=False, eod_flatten=None)
+        if (crashed_with_position and "FAKE" in pf5.positions
+                and abs(pf5.cash - pf4.cash) < 1e-6
+                and pf5.positions["FAKE"].stop_loss == pf4.positions["FAKE"].stop_loss):
+            print("PASS restart: same-day position, cash, and bracket resumed from DB")
+        else:
+            print(f"FAIL restart: crashed_with_position={crashed_with_position}, "
+                  f"restored={list(pf5.positions)}, cash={pf5.cash}", file=sys.stderr)
+            failures += 1
+    finally:
+        Path(state_db).unlink(missing_ok=True)
 
     if failures:
         print(f"\n{failures} failure(s)", file=sys.stderr)

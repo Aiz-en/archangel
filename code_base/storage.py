@@ -4,9 +4,11 @@ Default DB lives at `archangel.db` at the project root (gitignored via
 `*.db`). Runs accumulate into the same file so a real history builds up
 over time.
 
-Schema is intentionally minimal — closed trades and equity snapshots
-only. Pending/rejected orders aren't logged because the closed trade is
-the post-mortem unit; we can add more tables later if analysis needs them.
+Schema is intentionally minimal — closed trades, equity snapshots, and a
+small live-runner state snapshot (open positions + cash) so a crashed or
+restarted runner can resume the same day's session instead of forgetting
+its positions. Pending/rejected orders aren't logged because the closed
+trade is the post-mortem unit.
 """
 
 from __future__ import annotations
@@ -17,9 +19,9 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
-from paper_engine import ClosedTrade, Portfolio
+from paper_engine import ClosedTrade, Portfolio, Position
 
 
 SCHEMA = """
@@ -42,6 +44,21 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     cash                  REAL    NOT NULL,
     total_equity          REAL    NOT NULL,
     open_positions_count  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS open_positions (
+    symbol       TEXT    PRIMARY KEY,
+    quantity     REAL    NOT NULL,
+    entry_price  REAL    NOT NULL,
+    entry_time   TEXT    NOT NULL,
+    stop_loss    REAL,
+    take_profit  REAL,
+    saved_at     TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runner_state (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_symbol     ON closed_trades(symbol);
@@ -118,6 +135,71 @@ class TradeLog:
                 FROM closed_trades ORDER BY id DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
+
+    # -- live-runner state (crash/restart recovery) -------------------------
+    # One runner per DB file: the snapshot is a singleton, overwritten each
+    # save. Two runners sharing a DB would clobber each other's state.
+
+    def save_portfolio_state(self, portfolio: Portfolio, now: datetime) -> None:
+        """Overwrite the open-positions + cash snapshot for this runner."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM open_positions")
+            for pos in portfolio.positions.values():
+                conn.execute(
+                    """INSERT INTO open_positions
+                    (symbol, quantity, entry_price, entry_time,
+                     stop_loss, take_profit, saved_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        pos.symbol,
+                        pos.quantity,
+                        pos.entry_price,
+                        pos.entry_time.isoformat(),
+                        pos.stop_loss,
+                        pos.take_profit,
+                        now.isoformat(),
+                    ),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO runner_state (key, value) VALUES ('cash', ?)",
+                (repr(portfolio.cash),),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO runner_state (key, value) VALUES ('saved_at', ?)",
+                (now.isoformat(),),
+            )
+
+    def load_portfolio_state(
+        self,
+    ) -> tuple[Optional[float], list[Position], Optional[datetime]]:
+        """(cash, open positions, saved_at) — (None, [], None) if never saved."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT symbol, quantity, entry_price, entry_time,
+                          stop_loss, take_profit
+                   FROM open_positions"""
+            ).fetchall()
+            state = dict(
+                conn.execute("SELECT key, value FROM runner_state").fetchall()
+            )
+        if "saved_at" not in state:
+            return None, [], None
+        positions = [
+            Position(
+                symbol=r[0],
+                quantity=r[1],
+                entry_price=r[2],
+                entry_time=datetime.fromisoformat(r[3]),
+                stop_loss=r[4],
+                take_profit=r[5],
+            )
+            for r in rows
+        ]
+        return (
+            float(state["cash"]),
+            positions,
+            datetime.fromisoformat(state["saved_at"]),
+        )
 
 
 def _smoke_test() -> int:
