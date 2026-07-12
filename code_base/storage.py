@@ -68,8 +68,31 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_ts      ON equity_snapshots(timestamp);
 
 
 class TradeLog:
-    def __init__(self, db_path: str | Path = "archangel.db") -> None:
+    def __init__(
+        self, db_path: str | Path = "archangel.db", exclusive: bool = False
+    ) -> None:
+        """`exclusive=True` takes a process-lifetime advisory lock on
+        `<db>.lock` and refuses to start if another process holds it — the
+        enforcement behind the one-runner-per-DB rule. Two live runners on the
+        same DB would alternately clobber each other's position snapshots and
+        double-log fills. Short-lived readers (backtest, analysis) don't need
+        it."""
         self.db_path = str(db_path)
+        self._lock_file = None
+        if exclusive:
+            import fcntl
+
+            lock_path = self.db_path + ".lock"
+            self._lock_file = open(lock_path, "w")
+            try:
+                fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self._lock_file.close()
+                self._lock_file = None
+                raise RuntimeError(
+                    f"{lock_path} is held by another process — one runner per "
+                    f"DB. Is a live runner already using {self.db_path}?"
+                )
         with self._connect() as conn:
             conn.executescript(SCHEMA)
 
@@ -82,24 +105,77 @@ class TradeLog:
         finally:
             conn.close()
 
-    def record_trade(self, trade: ClosedTrade) -> None:
-        with self._connect() as conn:
+    @staticmethod
+    def _insert_trade(conn: sqlite3.Connection, trade: ClosedTrade) -> None:
+        conn.execute(
+            """INSERT INTO closed_trades
+            (symbol, quantity, entry_price, exit_price,
+             entry_time, exit_time, pnl, exit_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                trade.symbol,
+                trade.quantity,
+                trade.entry_price,
+                trade.exit_price,
+                trade.entry_time.isoformat(),
+                trade.exit_time.isoformat(),
+                trade.pnl,
+                trade.exit_reason,
+            ),
+        )
+
+    @staticmethod
+    def _insert_equity(
+        conn: sqlite3.Connection,
+        timestamp: datetime,
+        portfolio: Portfolio,
+        marks: dict[str, float],
+    ) -> None:
+        conn.execute(
+            """INSERT INTO equity_snapshots
+            (timestamp, cash, total_equity, open_positions_count)
+            VALUES (?, ?, ?, ?)""",
+            (
+                timestamp.isoformat(),
+                portfolio.cash,
+                portfolio.equity(marks),
+                len(portfolio.positions),
+            ),
+        )
+
+    @staticmethod
+    def _write_state(
+        conn: sqlite3.Connection, portfolio: Portfolio, now: datetime
+    ) -> None:
+        conn.execute("DELETE FROM open_positions")
+        for pos in portfolio.positions.values():
             conn.execute(
-                """INSERT INTO closed_trades
-                (symbol, quantity, entry_price, exit_price,
-                 entry_time, exit_time, pnl, exit_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO open_positions
+                (symbol, quantity, entry_price, entry_time,
+                 stop_loss, take_profit, saved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    trade.symbol,
-                    trade.quantity,
-                    trade.entry_price,
-                    trade.exit_price,
-                    trade.entry_time.isoformat(),
-                    trade.exit_time.isoformat(),
-                    trade.pnl,
-                    trade.exit_reason,
+                    pos.symbol,
+                    pos.quantity,
+                    pos.entry_price,
+                    pos.entry_time.isoformat(),
+                    pos.stop_loss,
+                    pos.take_profit,
+                    now.isoformat(),
                 ),
             )
+        conn.execute(
+            "INSERT OR REPLACE INTO runner_state (key, value) VALUES ('cash', ?)",
+            (repr(portfolio.cash),),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO runner_state (key, value) VALUES ('saved_at', ?)",
+            (now.isoformat(),),
+        )
+
+    def record_trade(self, trade: ClosedTrade) -> None:
+        with self._connect() as conn:
+            self._insert_trade(conn, trade)
 
     def record_equity(
         self,
@@ -108,17 +184,25 @@ class TradeLog:
         marks: dict[str, float],
     ) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """INSERT INTO equity_snapshots
-                (timestamp, cash, total_equity, open_positions_count)
-                VALUES (?, ?, ?, ?)""",
-                (
-                    timestamp.isoformat(),
-                    portfolio.cash,
-                    portfolio.equity(marks),
-                    len(portfolio.positions),
-                ),
-            )
+            self._insert_equity(conn, timestamp, portfolio, marks)
+
+    def persist_cycle_state(
+        self,
+        trades: list[ClosedTrade],
+        timestamp: datetime,
+        portfolio: Portfolio,
+        marks: dict[str, float],
+    ) -> None:
+        """New trades + equity snapshot + position/cash state in ONE
+        transaction. A crash between separate writes could leave the DB
+        claiming an already-recorded trade's position is still open; a single
+        transaction commits all of it or none of it."""
+        with self._connect() as conn:
+            for trade in trades:
+                self._insert_trade(conn, trade)
+            if trades:
+                self._insert_equity(conn, timestamp, portfolio, marks)
+            self._write_state(conn, portfolio, timestamp)
 
     def trade_count(self) -> int:
         with self._connect() as conn:
@@ -143,31 +227,7 @@ class TradeLog:
     def save_portfolio_state(self, portfolio: Portfolio, now: datetime) -> None:
         """Overwrite the open-positions + cash snapshot for this runner."""
         with self._connect() as conn:
-            conn.execute("DELETE FROM open_positions")
-            for pos in portfolio.positions.values():
-                conn.execute(
-                    """INSERT INTO open_positions
-                    (symbol, quantity, entry_price, entry_time,
-                     stop_loss, take_profit, saved_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        pos.symbol,
-                        pos.quantity,
-                        pos.entry_price,
-                        pos.entry_time.isoformat(),
-                        pos.stop_loss,
-                        pos.take_profit,
-                        now.isoformat(),
-                    ),
-                )
-            conn.execute(
-                "INSERT OR REPLACE INTO runner_state (key, value) VALUES ('cash', ?)",
-                (repr(portfolio.cash),),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO runner_state (key, value) VALUES ('saved_at', ?)",
-                (now.isoformat(),),
-            )
+            self._write_state(conn, portfolio, now)
 
     def load_portfolio_state(
         self,

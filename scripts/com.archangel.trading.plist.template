@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launch agent: starts the trading session script each weekday at
+  8:25 LOCAL time. On a machine running US Central time that is 9:25 ET,
+  five minutes before the opening bell — adjust Hour if the machine's
+  timezone differs. Holiday mornings are handled by the runner itself
+  (it exits immediately on non-trading days).
+
+  Install (run from the repo root):
+    mkdir -p logs   # launchd opens StandardOutPath before the script runs;
+                    # it creates the file but NOT missing directories
+    sed "s|__PROJECT_DIR__|$PWD|g" scripts/com.archangel.trading.plist.template \
+      > ~/Library/LaunchAgents/com.archangel.trading.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.archangel.trading.plist
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/com.archangel.trading
+    rm ~/Library/LaunchAgents/com.archangel.trading.plist
+
+  Power caveats: launchd only fires if the Mac is awake and you are logged
+  in. To wake the machine automatically before the bell:
+    sudo pmset repeat wakeorpoweron MTWRF 08:20:00
+  The session script holds `caffeinate -i` while running, which prevents
+  IDLE sleep during the trading day but not lid-close sleep. If the trigger
+  is missed entirely (powered off), the day is skipped — check
+  logs/launchd.log and logs/live_YYYYMMDD.log if a day looks empty.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.archangel.trading</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>__PROJECT_DIR__/scripts/run_trading_session.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>25</integer></dict>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/launchd.log</string>
+</dict>
+</plist>

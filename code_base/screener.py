@@ -46,6 +46,7 @@ from threading import Event, Lock, Thread
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from market_calendar import REGULAR_OPEN, is_trading_day, market_close_time
 from scanner import Mover, WebullScanner
 
 _ET = ZoneInfo("America/New_York")
@@ -150,11 +151,12 @@ def enrich(symbol: str, today: Optional[date] = None) -> tuple[Optional[float], 
 
 
 def is_market_open(now: Optional[datetime] = None) -> bool:
-    """US regular trading hours, Mon-Fri 9:30-16:00 ET. Ignores holidays (v1)."""
+    """US regular trading hours, holiday- and half-day-aware (market_calendar)."""
     now = now or datetime.now(_ET)
-    if now.weekday() >= 5:  # Sat/Sun
+    d = now.date()
+    if not is_trading_day(d):
         return False
-    return time_of_day(9, 30) <= now.time() <= time_of_day(16, 0)
+    return REGULAR_OPEN <= now.time() <= market_close_time(d)
 
 
 def screen_once(
@@ -360,7 +362,92 @@ class LiveScreener:
         self._stop.set()
 
 
+def _offline_test() -> int:
+    """Deterministic, no-network checks of the filter/counter/cache logic."""
+    failures = 0
+
+    class _StubScanner:
+        def __init__(self, movers: list[Mover]) -> None:
+            self._movers = movers
+
+        def get_top_gainers(self, min_pct_change=70.0, max_results=50, rank_type="1d"):
+            return [m for m in self._movers if m.pct_change >= min_pct_change]
+
+    movers = [
+        Mover("GOOD", 85.0, 5.0, 3_000_000),      # passes everything (rvol 7.5x)
+        Mover("BIGFLT", 90.0, 4.0, 2_000_000),    # fails float cap
+        Mover("NODATA", 75.0, 3.0, 1_500_000),    # enrichment returns Nones
+        Mover("CHEAP", 95.0, 0.5, 9_000_000),     # fails price band (coarse pass)
+    ]
+    stub = _StubScanner(movers)
+    fundamentals = {
+        "GOOD": (10e6, 400_000.0, 50e6),
+        "BIGFLT": (50e6, 300_000.0, 80e6),
+        "NODATA": (None, None, None),
+    }
+
+    original_fetch = _fetch_fundamentals
+    globals()["_fetch_fundamentals"] = lambda s: fundamentals.get(s, (None, None, None))
+    with _cache_lock:
+        _enrich_cache.clear()
+    try:
+        # Case 1: strict criteria — one survivor, drops counted by cause.
+        strict = ScreenCriteria(min_pct_change=70.0)
+        r = screen_once(strict, scanner=stub)
+        ok = (
+            [c.symbol for c in r.candidates] == ["GOOD"]
+            and r.gainers_scanned == 4 and r.enriched == 3
+            and r.dropped == 1 and r.dropped_missing == 1
+            and len(r.candidates) + r.dropped + r.dropped_missing == r.enriched
+        )
+        print(f"{'PASS' if ok else 'FAIL'} offline strict screen: "
+              f"cands={[c.symbol for c in r.candidates]} dropped={r.dropped} "
+              f"missing={r.dropped_missing}")
+        failures += 0 if ok else 1
+
+        # Case 2: keep-on-missing mode retains the unevaluable symbol.
+        keep = ScreenCriteria(min_pct_change=70.0, drop_on_missing_data=False)
+        r2 = screen_once(keep, scanner=stub)
+        ok = sorted(c.symbol for c in r2.candidates) == ["GOOD", "NODATA"]
+        print(f"{'PASS' if ok else 'FAIL'} offline keep-missing: "
+              f"{sorted(c.symbol for c in r2.candidates)}")
+        failures += 0 if ok else 1
+
+        # Case 3: failures aren't cached for the day; successes are.
+        globals()["_fetch_fundamentals"] = lambda s: (7e6, 200_000.0, 30e6)
+        retried = enrich("NODATA")  # earlier total miss must retry, not cache-hit
+        globals()["_fetch_fundamentals"] = lambda s: (None, None, None)
+        cached = enrich("GOOD")     # earlier success must come from cache
+        ok = retried[0] == 7e6 and cached[0] == 10e6
+        print(f"{'PASS' if ok else 'FAIL'} offline cache: failed fetch retried "
+              f"(float={retried[0]}), success cached (float={cached[0]})")
+        failures += 0 if ok else 1
+
+        # Case 4: a real 0-value renders as 0, not as '?' (missing).
+        zero = Candidate("ZERO", 80.0, 2.0, 1_000_000, 0.0, 0.0, 0.0, 0.0)
+        row = render_table(
+            ScreenResult(candidates=[zero]), ScreenCriteria(), clear=False
+        ).splitlines()
+        zero_line = next(l for l in row if "ZERO" in l)
+        ok = "?" not in zero_line
+        print(f"{'PASS' if ok else 'FAIL'} offline render: 0-valued fundamentals "
+              f"don't render as '?'")
+        failures += 0 if ok else 1
+    finally:
+        globals()["_fetch_fundamentals"] = original_fetch
+        with _cache_lock:
+            _enrich_cache.clear()
+
+    return failures
+
+
 def _smoke_test() -> int:
+    offline_failures = _offline_test()
+    if offline_failures:
+        print(f"\n{offline_failures} offline failure(s)", file=sys.stderr)
+        return 1
+    print()
+
     # 1. Enrichment path works regardless of market state (uses a liquid name).
     f_shares, avg_vol, mcap = enrich("AAPL")
     print("Enrichment sanity (AAPL):")

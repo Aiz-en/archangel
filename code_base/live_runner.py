@@ -35,9 +35,12 @@ Live-data discipline (the parts that differ from historical walking):
 - Entry limit orders that sit unfilled for entry_ttl_minutes are canceled:
   in live mode an old limit at a stale 9 EMA value is no longer the setup
   we priced.
-- End of day: at eod_flatten (default 15:55 ET) open positions are closed
-  at the last seen price and pending orders canceled — this bot does not
-  hold low-float movers overnight. Disable with --no-eod-flatten.
+- End of day: at the flatten deadline (default "auto" = 5 minutes before
+  the calendar close: 15:55 normally, 12:55 on 1:00pm half-days) open
+  positions are closed at the last seen price and pending orders canceled —
+  this bot does not hold low-float movers overnight. Every session-exit
+  path (the deadline itself, --exit-after-close, a day rollover after
+  sleeping through midnight) flattens first. Disable with --no-eod-flatten.
 """
 
 from __future__ import annotations
@@ -48,12 +51,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from datetime import time as time_of_day
 from threading import Event
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from ema import fetch_with_ema
+from market_calendar import is_trading_day, market_close_time
 from paper_engine import Bar, OrderStatus, Portfolio, Side
 from screener import ScreenCriteria, ScreenResult, is_market_open, screen_once
 from storage import TradeLog
@@ -121,9 +125,10 @@ class LiveRunner:
         stop_pct: float = 0.05,
         tp_pct: float = 0.10,
         entry_ttl_minutes: float = 10.0,
-        eod_flatten: Optional[time_of_day] = time_of_day(15, 55),
+        eod_flatten: Union[time_of_day, str, None] = "auto",
         respect_market_hours: bool = True,
         replay_today: bool = False,
+        exit_after_close: bool = False,
         finality_lag_seconds: float = 90.0,
         bar_fetcher: Optional[BarFetcher] = None,
         screen: Optional[Callable[[ScreenCriteria], ScreenResult]] = None,
@@ -140,6 +145,7 @@ class LiveRunner:
         self.eod_flatten = eod_flatten
         self.respect_market_hours = respect_market_hours
         self.replay_today = replay_today
+        self.exit_after_close = exit_after_close
         self.finality_lag_seconds = finality_lag_seconds
         # Entries only fire on bars this fresh. A symbol can drop off the
         # watchlist for a few cycles (screener blip) and come back — its gap
@@ -206,19 +212,19 @@ class LiveRunner:
         # today (market-hours idle), so flatten NOW or the position gets
         # carried overnight — the one thing this bot must never do. No market
         # price is available yet, so close neutrally at entry price.
-        if self.eod_flatten is not None and now.time() >= self.eod_flatten:
+        deadline = self._flatten_deadline(now)
+        if deadline is not None and now.time() >= deadline:
             for symbol in list(self.portfolio.positions):
                 pos = self.portfolio.positions[symbol]
                 self.portfolio.close_position_at(symbol, pos.entry_price, now, "eod_flatten")
             try:
-                self._flush_trade_log(now)
-                self.trade_log.save_portfolio_state(self.portfolio, now)
+                self._persist(now)
             except Exception as exc:
                 print(f"[runner] post-deadline flatten persist failed: {exc}",
                       file=sys.stderr, flush=True)
             print(
                 f"[runner] restored {len(positions)} position(s) past the "
-                f"{self.eod_flatten:%H:%M} flatten deadline — closed at entry price, "
+                f"{deadline:%H:%M} flatten deadline — closed at entry price, "
                 f"NOT carried overnight.", flush=True,
             )
             return
@@ -228,6 +234,20 @@ class LiveRunner:
             f"({', '.join(p.symbol for p in positions)}), cash ${self.portfolio.cash:.2f}",
             flush=True,
         )
+
+    def _flatten_deadline(self, now: datetime) -> Optional[time_of_day]:
+        """Entry-lockout / flatten time for `now`'s date, or None if disabled.
+
+        "auto" (the default) tracks the real closing bell — 15:55 on normal
+        days, 12:55 on 1:00pm half-days (market_calendar)."""
+        if self.eod_flatten is None:
+            return None
+        if self.eod_flatten == "auto":
+            close = market_close_time(now.date())
+            return (
+                datetime.combine(now.date(), close) - timedelta(minutes=5)
+            ).time()
+        return self.eod_flatten
 
     # -- one poll cycle ----------------------------------------------------
 
@@ -266,9 +286,8 @@ class LiveRunner:
         # No fresh entries once we're inside the flatten window — otherwise
         # the loop buys at 15:56 only to force-close the same position at
         # 15:57, churning spread until the bell.
-        allow_entries = (
-            self.eod_flatten is None or now.time() < self.eod_flatten
-        )
+        deadline = self._flatten_deadline(now)
+        allow_entries = deadline is None or now.time() < deadline
 
         # 3. Walk every symbol we owe attention: watchlist + open/pending.
         symbols = list(dict.fromkeys(  # ordered de-dupe
@@ -294,32 +313,28 @@ class LiveRunner:
                 )
                 self.portfolio.close_position_at(symbol, price, now, "eod_flatten")
 
-        # 5. Log anything not yet persisted (guarded: a failed DB write must
-        # not kill the session — the persistent counter retries next cycle).
+        # 5. Persist everything not yet on disk (guarded: a failed DB write
+        # must not kill the session — the high-water counter retries next
+        # cycle).
         report.trades_closed = len(self.portfolio.closed_trades) - trades_before
         report.equity = self.portfolio.equity(self._last_close)
         try:
-            self._flush_trade_log(now)
+            self._persist(now)
         except Exception as exc:
-            report.errors.append(f"trade-log: {type(exc).__name__}: {exc}")
-        try:
-            if self.trade_log is not None:
-                self.trade_log.save_portfolio_state(self.portfolio, now)
-        except Exception as exc:
-            report.errors.append(f"state-save: {type(exc).__name__}: {exc}")
+            report.errors.append(f"persist: {type(exc).__name__}: {exc}")
         return report
 
-    def _flush_trade_log(self, now: datetime) -> None:
-        """Persist closed trades past the high-water mark, plus a snapshot."""
+    def _persist(self, now: datetime) -> None:
+        """Unlogged trades + equity snapshot + position/cash state, in ONE
+        SQLite transaction — a crash can't land between them and leave the DB
+        claiming a closed position is still open."""
         if self.trade_log is None:
             return
         unlogged = self.portfolio.closed_trades[self._trades_logged:]
-        if not unlogged:
-            return
-        for trade in unlogged:
-            self.trade_log.record_trade(trade)
-            self._trades_logged += 1
-        self.trade_log.record_equity(now, self.portfolio, marks=self._last_close)
+        self.trade_log.persist_cycle_state(
+            unlogged, now, self.portfolio, self._last_close
+        )
+        self._trades_logged = len(self.portfolio.closed_trades)
 
     def _process_symbol(
         self, symbol: str, now: datetime, allow_entries: bool
@@ -432,9 +447,31 @@ class LiveRunner:
 
     # -- the loop ----------------------------------------------------------
 
+    def _flatten_all_and_persist(self, now: datetime, where: str) -> None:
+        """Force-close everything and persist — for session-exit paths that
+        bypass cycle()'s own flatten step (--exit-after-close, day rollover).
+        Without this, an exit while holding a position leaves the DB claiming
+        it's open, and the next day's rehydrate abandons it un-closed."""
+        canceled = len(self.portfolio.cancel_pending())
+        closed = 0
+        for symbol in list(self.portfolio.positions):
+            pos = self.portfolio.positions[symbol]
+            price = self._last_close.get(symbol, pos.entry_price)
+            self.portfolio.close_position_at(symbol, price, now, "eod_flatten")
+            closed += 1
+        if closed or canceled:
+            print(f"[runner] {where}: flattened {closed} position(s), "
+                  f"canceled {canceled} order(s).", flush=True)
+        try:
+            self._persist(now)
+        except Exception as exc:
+            print(f"[runner] persist during {where} failed: {exc}",
+                  file=sys.stderr, flush=True)
+
     def run(self) -> None:
         """Blocking poll loop until Ctrl-C or stop()."""
         self._stop.clear()
+        session_date = datetime.now(_ET).date()
         print(
             f"Live runner up [{self.criteria.describe()}] — "
             f"${self.position_size_usd:g}/position, max {self.max_concurrent}, "
@@ -444,9 +481,36 @@ class LiveRunner:
         )
         try:
             while not self._stop.is_set():
+                now = datetime.now(_ET)
+                if now.date() != session_date:
+                    # Slept through midnight (laptop lid closed mid-session).
+                    # Yesterday's session is over — never carry its positions
+                    # into a new day, and never let a stale process quietly
+                    # become today's runner.
+                    if self.eod_flatten is not None:
+                        self._flatten_all_and_persist(now, "day rollover")
+                    if self.exit_after_close:
+                        print(f"[{now:%H:%M:%S} ET] New day — exiting "
+                              f"(--exit-after-close); launchd starts fresh.",
+                              flush=True)
+                        break
+                    session_date = now.date()
                 if self.respect_market_hours and not is_market_open():
+                    if self.exit_after_close and (
+                        not is_trading_day(now.date())
+                        or now.time() > market_close_time(now.date())
+                    ):
+                        # Launch-agent mode: the session is over (or today was
+                        # never a trading day) — flatten anything cycle()'s own
+                        # deadline missed (e.g. we slept over the close), then
+                        # exit. launchd starts us fresh tomorrow.
+                        if self.eod_flatten is not None:
+                            self._flatten_all_and_persist(now, "session end")
+                        print(f"[{now:%H:%M:%S} ET] Session over — exiting "
+                              f"(--exit-after-close).", flush=True)
+                        break
                     print(
-                        f"[{datetime.now(_ET):%H:%M:%S} ET] Market closed — idling. "
+                        f"[{now:%H:%M:%S} ET] Market closed — idling. "
                         f"(--ignore-hours to run anyway)",
                         flush=True,
                     )
@@ -471,21 +535,13 @@ class LiveRunner:
 
     def _shutdown(self) -> None:
         # Ctrl-C can land mid-cycle, after a trade closed but before step 5
-        # persisted it — flush the high-water mark so the DB never loses one,
-        # AND re-save the position snapshot so it agrees with the flushed
-        # trades. Flushing without saving would leave the DB claiming an
-        # already-closed position is still open; a same-day restart would then
-        # resurrect it and double-count the trade.
+        # persisted it — one final atomic persist writes the missed trades and
+        # a position snapshot that agrees with them, so a same-day restart
+        # can't resurrect a closed position and double-count the trade.
         try:
-            self._flush_trade_log(datetime.now(_ET))
+            self._persist(datetime.now(_ET))
         except Exception as exc:
-            print(f"[runner] final trade-log flush failed: {exc}",
-                  file=sys.stderr, flush=True)
-        try:
-            if self.trade_log is not None:
-                self.trade_log.save_portfolio_state(self.portfolio, datetime.now(_ET))
-        except Exception as exc:
-            print(f"[runner] final state save failed: {exc}",
+            print(f"[runner] final persist failed: {exc}",
                   file=sys.stderr, flush=True)
         open_syms = list(self.portfolio.positions)
         print(
@@ -692,7 +748,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--max-float", type=float, default=d.max_float, metavar="SHARES",
                    help=f"Screener: max float (default: {d.max_float:,.0f}).")
     p.add_argument("--no-eod-flatten", action="store_true",
-                   help="Do not force-close positions at 15:55 ET.")
+                   help="Do not force-close positions before the closing bell.")
+    p.add_argument("--exit-after-close", action="store_true",
+                   help="Exit once today's session is over instead of idling "
+                        "(for launchd/cron-managed runs).")
     args = p.parse_args(argv)
 
     if args.smoke:
@@ -711,11 +770,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     runner = LiveRunner(
         portfolio=Portfolio(cash=args.cash),
         criteria=criteria,
-        trade_log=TradeLog(db_path=args.db),
+        trade_log=TradeLog(db_path=args.db, exclusive=True),
         refresh_seconds=args.refresh,
         respect_market_hours=not args.ignore_hours,
         replay_today=args.replay_today,
-        eod_flatten=None if args.no_eod_flatten else time_of_day(15, 55),
+        exit_after_close=args.exit_after_close,
+        eod_flatten=None if args.no_eod_flatten else "auto",
     )
     if args.once:
         runner._print_report(runner.cycle())

@@ -181,7 +181,77 @@ def _run_one_sweep(label: str, rank_type: str, threshold: float, max_results: in
     print(f"Total return:     {stats['total_return_pct']:+.2f}%")
 
 
+def _offline_test() -> int:
+    """No-network check of backtest() accounting and summarize_history math."""
+    import tempfile
+    from datetime import datetime, timedelta
+
+    from paper_engine import ClosedTrade
+
+    failures = 0
+    t0 = datetime(2026, 7, 6, 10, 0)
+
+    def fake_fetch_and_run(sym, portfolio, period="5d", trade_log=None, **kw):
+        if sym == "ERR":
+            raise RuntimeError("boom")
+        pnl = 100.0 if sym == "WIN" else -50.0
+        trade = ClosedTrade(
+            symbol=sym, quantity=10, entry_price=10.0, exit_price=10.0 + pnl / 10,
+            entry_time=t0, exit_time=t0 + timedelta(minutes=30),
+            pnl=pnl, exit_reason="take_profit" if pnl > 0 else "stop_loss",
+        )
+        portfolio.closed_trades.append(trade)
+        portfolio.cash += pnl
+        if trade_log is not None:
+            trade_log.record_trade(trade)
+            trade_log.record_equity(trade.exit_time, portfolio, marks={})
+        return {"bars_processed": 10}
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    original = globals()["fetch_and_run"]
+    globals()["fetch_and_run"] = fake_fetch_and_run
+    try:
+        pf = Portfolio(cash=5_000.0)
+        log = TradeLog(db_path=db_path)
+        result = backtest(["WIN", "ERR", "LOSE"], pf, trade_log=log)
+        per = result["per_symbol"]
+        ok = (
+            per["WIN"]["trades"] == 1 and per["WIN"]["wins"] == 1
+            and per["WIN"]["pnl"] == 100.0
+            and "error" in per["ERR"] and "boom" in per["ERR"]["error"]
+            and per["LOSE"]["losses"] == 1 and per["LOSE"]["pnl"] == -50.0
+        )
+        print(f"{'PASS' if ok else 'FAIL'} offline backtest accounting: {per}")
+        failures += 0 if ok else 1
+
+        stats = summarize_history(log, starting_equity=5_000.0)
+        ok = (
+            stats["trades"] == 2 and stats["wins"] == 1
+            and abs(stats["win_rate_pct"] - 50.0) < 1e-9
+            and abs(stats["expectancy"] - 25.0) < 1e-9
+            and abs(stats["total_pnl"] - 50.0) < 1e-9
+            and abs(stats["final_equity"] - 5_050.0) < 1e-9
+            # equity peaked at 5100 after WIN, troughed at 5050 after LOSE
+            and abs(stats["max_drawdown_pct"] - (50.0 / 5_100.0 * 100)) < 1e-6
+        )
+        print(f"{'PASS' if ok else 'FAIL'} offline summarize_history: "
+              f"win_rate={stats['win_rate_pct']:.0f}% expectancy=${stats['expectancy']:.2f} "
+              f"dd={stats['max_drawdown_pct']:.2f}%")
+        failures += 0 if ok else 1
+    finally:
+        globals()["fetch_and_run"] = original
+        Path(db_path).unlink(missing_ok=True)
+    return failures
+
+
 def _smoke_test() -> int:
+    offline_failures = _offline_test()
+    if offline_failures:
+        print(f"\n{offline_failures} offline failure(s)", file=sys.stderr)
+        return 1
+    print()
+
     # Sweep 1: today's parabolic movers (the strategy's design target).
     _run_one_sweep("today's +70% intraday movers", rank_type="1d", threshold=70.0, max_results=20)
     # Sweep 2: stocks up >= 100% over the past 5 days. Most of these will

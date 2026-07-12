@@ -22,8 +22,10 @@ venv/
 # Project
 *.db
 *.sqlite
+*.lock
 *.log
-logs/
+logs/*
+!logs/.gitkeep
 conf/
 
 # Webull unofficial library — auth/device state and cached credentials

@@ -43,8 +43,9 @@ mode** against real market data with locally simulated fills.
 Two runners drive these stages: `runner.py` walks a fixed span of recent
 history (the backtest path), and `live_runner.py` polls the market in real
 time during trading hours — screening, entering, managing stops/take-profits,
-force-flattening everything at 3:55pm ET, and surviving crashes by resuming
-its same-day positions from SQLite on restart.
+force-flattening everything five minutes before the closing bell (holiday- and
+half-day-aware), and surviving crashes by resuming its same-day positions from
+SQLite on restart.
 
 The full strategy specification lives in
 [docs/trading_strategy_baseline.md](docs/trading_strategy_baseline.md).
@@ -93,8 +94,9 @@ python code_base/screener.py --help         # every criterion has a flag
 ```
 
 **Live paper trading** — polls every 30s during market hours, trades the
-watchlist with simulated fills, flattens at 3:55pm ET, logs to
-`archangel_live.db`:
+watchlist with simulated fills, flattens before the bell, logs to
+`archangel_live.db`. `scripts/` has a launchd template to start it every
+trading morning automatically:
 
 ```bash
 python code_base/live_runner.py            # the real thing (idles off-hours)
@@ -138,10 +140,12 @@ code_base/
   storage.py       # SQLite trade/equity persistence
   ema.py           # EMA helpers (trader-standard recursive form)
   webull_paper.py  # Webull paper-account broker (read-only scaffold)
+  market_calendar.py  # NYSE holidays + 1pm early closes (through 2027)
   hello_webull.py  # Webull OpenAPI auth smoke test
   hello_quote.py   # yfinance data-fetch smoke test
   practice.py      # Python learning scratchpad (not part of the bot)
 docs/              # strategy spec + Webull API research
+scripts/           # launchd agent: auto-start the runners each trading morning
 ```
 
 ## Status & roadmap
