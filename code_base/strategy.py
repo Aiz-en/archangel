@@ -36,11 +36,20 @@ def detect_bull_flag_setup(
     min_pullback: int = 2,
     max_pullback: int = 3,
     ema_col: str = "EMA_12",
+    ema_floor: str = "low",
+    doji_tolerant_pole: bool = False,
 ) -> Optional[BullFlagSetup]:
     """Return a setup if the last bars match the bull-flag pattern, else None.
 
     `bars_5m` must have Open/High/Low/Close columns and an `ema_col` column
     (typically EMA_12), with rows in chronological order.
+
+    The defaults are the documented baseline strategy. The relaxation knobs
+    exist for the fast-mover experiments (see ENTRY_MODES):
+    - ema_floor="close": bodies must hold the EMA but wicks may pierce it
+      (violent low-float tapes wick through EMAs on most bars).
+    - doji_tolerant_pole=True: a doji doesn't break the pole run, but the
+      pole must still contain at least one true green candle.
     """
     if ema_col not in bars_5m.columns:
         raise ValueError(f"bars_5m missing required column {ema_col!r}")
@@ -49,7 +58,11 @@ def detect_bull_flag_setup(
 
     is_green = bars_5m["Close"] > bars_5m["Open"]
     is_red = bars_5m["Close"] < bars_5m["Open"]
-    above_ema = bars_5m["Low"] >= bars_5m[ema_col]
+    pole_bar_ok = ~is_red if doji_tolerant_pole else is_green
+    if ema_floor == "close":
+        above_ema = bars_5m["Close"] >= bars_5m[ema_col]
+    else:
+        above_ema = bars_5m["Low"] >= bars_5m[ema_col]
 
     # Try larger pullbacks first — more selective when both fit.
     for pullback_n in range(max_pullback, min_pullback - 1, -1):
@@ -57,11 +70,12 @@ def detect_bull_flag_setup(
         if len(bars_5m) < window_size:
             continue
 
-        pole_slice = is_green.iloc[-window_size:-pullback_n]
+        pole_slice = pole_bar_ok.iloc[-window_size:-pullback_n]
+        pole_has_green = is_green.iloc[-window_size:-pullback_n].any()
         pullback_slice = is_red.iloc[-pullback_n:]
         ema_slice = above_ema.iloc[-window_size:]
 
-        if not pole_slice.all():
+        if not (pole_slice.all() and pole_has_green):
             continue
         if not pullback_slice.all():
             continue
@@ -76,6 +90,30 @@ def detect_bull_flag_setup(
             window_end=window.index[-1],
         )
     return None
+
+
+# Named entry-rule configurations. "strict" is the documented baseline
+# strategy (docs/trading_strategy_baseline.md). "relaxed" is the fast-mover
+# experiment: pole >=2 with dojis tolerated, pullback 1-3 reds, EMA floor on
+# closes. Measured on 6 candidate tapes over 5 days (2026-07-13): strict took
+# 1 trade, relaxed took 43 at a 30% win rate (breakeven for the -5%/+10%
+# bracket is 33.3%) — relaxed exists to gather evidence at volume on the
+# shadow runner, NOT because it has proven edge yet.
+ENTRY_MODES: dict[str, dict] = {
+    "strict": {},
+    "relaxed": dict(
+        min_pole=2, min_pullback=1, ema_floor="close", doji_tolerant_pole=True
+    ),
+}
+
+
+def detect_setup(bars_5m: pd.DataFrame, mode: str = "strict") -> Optional[BullFlagSetup]:
+    """Mode-selected entry detection — the single gate runners should call."""
+    try:
+        params = ENTRY_MODES[mode]
+    except KeyError:
+        raise ValueError(f"unknown entry mode {mode!r}; choose from {sorted(ENTRY_MODES)}")
+    return detect_bull_flag_setup(bars_5m, **params)
 
 
 def is_9_ema_touch(bar_low: float, bar_high: float, ema_9: float) -> bool:
@@ -156,6 +194,26 @@ def _smoke_test() -> int:
         failures += 1
     else:
         print("PASS case 5: 9 EMA outside wick range -> no trigger")
+
+    # Case 6: fast-mover tape — green, doji, green pole with a 1-red rest.
+    # strict must reject it (doji breaks the pole, pullback too short);
+    # relaxed must accept it (doji-tolerant pole >=2, pullback >=1,
+    # close-basis EMA floor).
+    bars = _make_bars(_RUNWAY + [
+        (95.2, 96.7, 95.1, 96.5),   # green
+        (96.5, 97.0, 96.2, 96.5),   # doji
+        (96.5, 98.2, 96.4, 98.0),   # green
+        (98.0, 98.2, 97.2, 97.5),   # single red rest
+    ])
+    bars = add_ema(bars, [9, 12])
+    strict_hit = detect_setup(bars, mode="strict")
+    relaxed_hit = detect_setup(bars, mode="relaxed")
+    if strict_hit is None and relaxed_hit is not None:
+        print("PASS case 6: doji-pole tape — strict rejects, relaxed detects")
+    else:
+        print(f"FAIL case 6: strict={strict_hit}, relaxed={relaxed_hit}",
+              file=sys.stderr)
+        failures += 1
 
     if failures:
         print(f"\n{failures} failure(s)", file=sys.stderr)

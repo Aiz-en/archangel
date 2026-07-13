@@ -61,7 +61,7 @@ from market_calendar import is_trading_day, market_close_time
 from paper_engine import Bar, OrderStatus, Portfolio, Side
 from screener import ScreenCriteria, ScreenResult, is_market_open, screen_once
 from storage import TradeLog
-from strategy import detect_bull_flag_setup, is_9_ema_touch
+from strategy import ENTRY_MODES, detect_setup, is_9_ema_touch
 
 _ET = ZoneInfo("America/New_York")
 
@@ -130,9 +130,13 @@ class LiveRunner:
         replay_today: bool = False,
         exit_after_close: bool = False,
         finality_lag_seconds: float = 90.0,
+        entry_mode: str = "strict",
         bar_fetcher: Optional[BarFetcher] = None,
         screen: Optional[Callable[[ScreenCriteria], ScreenResult]] = None,
     ) -> None:
+        if entry_mode not in ENTRY_MODES:
+            raise ValueError(f"unknown entry mode {entry_mode!r}; choose from {sorted(ENTRY_MODES)}")
+        self.entry_mode = entry_mode
         self.portfolio = portfolio
         self.criteria = criteria or ScreenCriteria()
         self.trade_log = trade_log
@@ -429,7 +433,7 @@ class LiveRunner:
         ema_9 = row.get("EMA_9")
         if ema_9 is None or pd.isna(ema_9):
             return 0
-        if detect_bull_flag_setup(completed_5m) is None:
+        if detect_setup(completed_5m, self.entry_mode) is None:
             return 0
         if not is_9_ema_touch(
             bar_low=float(row["Low"]), bar_high=float(row["High"]), ema_9=float(ema_9)
@@ -487,7 +491,8 @@ class LiveRunner:
         self._session_date = datetime.now(_ET).date()
         print(
             f"Live runner up [{self.criteria.describe()}] — "
-            f"${self.position_size_usd:g}/position, max {self.max_concurrent}, "
+            f"entry={self.entry_mode}, ${self.position_size_usd:g}/position, "
+            f"max {self.max_concurrent}, "
             f"stop -{self.stop_pct:.0%} / TP +{self.tp_pct:.0%}, "
             f"refresh {self.refresh_seconds:g}s. Ctrl-C to stop.",
             flush=True,
@@ -808,6 +813,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--exit-after-close", action="store_true",
                    help="Exit once today's session is over instead of idling "
                         "(for launchd/cron-managed runs).")
+    p.add_argument("--entry-mode", default="strict", choices=sorted(ENTRY_MODES),
+                   help="Entry-rule set: 'strict' = documented baseline; "
+                        "'relaxed' = fast-mover experiment (pole>=2 with dojis, "
+                        "pullback 1-3 reds, EMA floor on closes). Default: strict.")
     args = p.parse_args(argv)
 
     if args.smoke:
@@ -831,6 +840,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         respect_market_hours=not args.ignore_hours,
         replay_today=args.replay_today,
         exit_after_close=args.exit_after_close,
+        entry_mode=args.entry_mode,
         eod_flatten=None if args.no_eod_flatten else "auto",
     )
     if args.once:

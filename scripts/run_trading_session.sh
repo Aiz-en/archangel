@@ -26,8 +26,12 @@ python code_base/live_runner.py --exit-after-close \
     >> "logs/live_$STAMP.log" 2>&1 &
 MAIN_PID=$!
 
+# Shadow = the evidence collector: wider screen AND the relaxed entry
+# grammar (fast-mover experiment). The main runner above stays the strict
+# control. Measured 2026-07-13: relaxed ~30% win rate vs 33.3% breakeven —
+# it runs to build a real sample, not because it has proven edge.
 python code_base/live_runner.py --exit-after-close \
-    --min-change 30 --db archangel_shadow.db \
+    --min-change 30 --db archangel_shadow.db --entry-mode relaxed \
     >> "logs/shadow_$STAMP.log" 2>&1 &
 SHADOW_PID=$!
 
