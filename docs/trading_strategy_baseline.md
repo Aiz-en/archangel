@@ -36,7 +36,10 @@ enforces them; defaults live in `ScreenCriteria`):
 2. Wait for a **pullback of 2-3 negative (red) candles**
 3. Pullback candle must **cross/touch the 9 EMA**
 4. Pullback must **NOT cross below the 12 EMA**
-5. Entry price is at the **intersection of the candle and the 9 EMA**
+5. Enter at **market** as soon as the trigger confirms (the 9 EMA touch on a
+   closed 1m bar) — fill at the prevailing market price, not a resting limit.
+   *(Corrected 2026-07-16: implementations before this date placed a limit
+   order at the 9 EMA value; the strategy is market-in on trigger.)*
 
 ## Exit Rules
 
@@ -45,8 +48,9 @@ enforces them; defaults live in `ScreenCriteria`):
 
 ## Position Sizing
 
-- **Fixed $1,000 per position** (does not scale with account growth for now)
-- Max loss per trade: $50 (5% of $1,000)
+- **Up to $1,000 per position**: as many **whole shares** as $1,000 allows,
+  rounded down (does not scale with account growth for now)
+- Max loss per trade: ~$50 (5% of the deployed amount)
 
 ## Concurrency
 

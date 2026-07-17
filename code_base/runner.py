@@ -22,9 +22,9 @@ from typing import Any, Optional
 import pandas as pd
 
 from ema import fetch_with_ema
-from paper_engine import Bar, Portfolio, Side
+from paper_engine import Bar, Portfolio
 from storage import TradeLog
-from strategy import detect_bull_flag_setup, is_9_ema_touch
+from strategy import detect_setup, is_9_ema_touch
 
 
 def run_strategy(
@@ -36,6 +36,7 @@ def run_strategy(
     max_concurrent: int = 3,
     stop_pct: float = 0.05,
     tp_pct: float = 0.10,
+    entry_mode: str = "strict",
     trade_log: Optional[TradeLog] = None,
 ) -> dict[str, Any]:
     if bars_5m.empty or bars_1m.empty:
@@ -55,22 +56,25 @@ def run_strategy(
         if no_position and no_pending and room and len(completed_5m) >= 5:
             ema_9 = row.get("EMA_9")
             if ema_9 is not None and pd.notna(ema_9):
-                setup = detect_bull_flag_setup(completed_5m)
+                setup = detect_setup(completed_5m, mode=entry_mode)
                 if setup is not None and is_9_ema_touch(
                     bar_low=float(row["Low"]),
                     bar_high=float(row["High"]),
                     ema_9=float(ema_9),
                 ):
-                    entry_price = float(ema_9)
-                    portfolio.submit_order(
-                        symbol=symbol,
-                        side=Side.BUY,
-                        quantity=position_size_usd / entry_price,
-                        limit_price=entry_price,
-                        submitted_at=ts.to_pydatetime(),
-                        stop_loss=entry_price * (1 - stop_pct),
-                        take_profit=entry_price * (1 + tp_pct),
-                    )
+                    # Market entry on trigger: fill at the trigger bar's
+                    # close, as many WHOLE shares as the budget allows.
+                    entry_price = float(row["Close"])
+                    quantity = int(position_size_usd // entry_price)
+                    if quantity >= 1:
+                        portfolio.submit_market_buy(
+                            symbol=symbol,
+                            quantity=quantity,
+                            price=entry_price,
+                            submitted_at=ts.to_pydatetime(),
+                            stop_loss=entry_price * (1 - stop_pct),
+                            take_profit=entry_price * (1 + tp_pct),
+                        )
 
         portfolio.process_bar(
             symbol,

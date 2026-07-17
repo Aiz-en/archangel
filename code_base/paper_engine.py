@@ -133,6 +133,45 @@ class Portfolio:
         self.pending_orders.append(order)
         return order
 
+    def submit_market_buy(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        submitted_at: datetime,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ) -> Order:
+        """Market entry: fills IMMEDIATELY at `price` (the last known market
+        price — in bar-based simulation, the trigger bar's close). No queue,
+        no waiting for a bar range to cross a limit. Zero slippage is assumed,
+        which is optimistic for thin low-float names; a slippage model can be
+        layered here later without touching callers.
+        """
+        order = Order(
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=quantity,
+            limit_price=price,  # recorded as the reference price
+            submitted_at=submitted_at,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+        if symbol in self.positions:
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = "position_already_open"
+            return order
+        if quantity <= 0:
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = "zero_quantity"
+            return order
+        if quantity * price > self.cash:
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = "insufficient_cash"
+            return order
+        self._fill_order(order, price, submitted_at)
+        return order
+
     def process_bar(self, symbol: str, bar: Bar) -> None:
         """Apply one bar of market data to all state for `symbol`."""
         # Exits first: if a stop and TP are both inside the bar's range, OHLC

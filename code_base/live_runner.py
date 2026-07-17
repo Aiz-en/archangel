@@ -58,7 +58,7 @@ import pandas as pd
 
 from ema import fetch_with_ema
 from market_calendar import is_trading_day, market_close_time
-from paper_engine import Bar, OrderStatus, Portfolio, Side
+from paper_engine import Bar, OrderStatus, Portfolio
 from screener import ScreenCriteria, ScreenResult, is_market_open, screen_once
 from storage import TradeLog
 from strategy import ENTRY_MODES, detect_setup, is_9_ema_touch
@@ -440,17 +440,22 @@ class LiveRunner:
         ):
             return 0
 
-        entry_price = float(ema_9)
-        self.portfolio.submit_order(
+        # Market entry the moment the trigger confirms: fill at the trigger
+        # bar's close (the last known price when a closed-bar signal fires),
+        # sized to as many WHOLE shares as the position budget allows.
+        entry_price = float(row["Close"])
+        quantity = int(self.position_size_usd // entry_price)
+        if quantity < 1:
+            return 0
+        order = self.portfolio.submit_market_buy(
             symbol=symbol,
-            side=Side.BUY,
-            quantity=self.position_size_usd / entry_price,
-            limit_price=entry_price,
+            quantity=quantity,
+            price=entry_price,
             submitted_at=ts.to_pydatetime(),
             stop_loss=entry_price * (1 - self.stop_pct),
             take_profit=entry_price * (1 + self.tp_pct),
         )
-        return 1
+        return 1 if order.status is OrderStatus.FILLED else 0
 
     # -- the loop ----------------------------------------------------------
 
@@ -618,9 +623,9 @@ def _smoke_test() -> int:
         # setup visible -> the trivial runway EMA hugs can't enter). The 5m
         # flag completes at 09:45; the 1m pole bars keep their lows ABOVE the
         # rising 9 EMA (no touch), then the 09:48 pullback bar wicks through
-        # it (~96.6) — that is the designed entry. It fills same-bar (touch
-        # range contains the EMA by definition — backtest parity), rides
-        # through 09:49, and the 09:50 bar crosses the +10% TP (~106.3).
+        # it — that is the designed trigger. Entry is a MARKET fill at that
+        # bar's close (96.4), whole shares; it rides through 09:49, and the
+        # 09:50 bar crosses the +10% TP (~106.0).
         rows = [(95.0, 95.3, 94.7, 95.2)] * 15               # runway 9:30-9:44
         rows += [(95.2, 96.6, 95.6, 96.5), (96.5, 98.1, 96.4, 98.0),
                  (98.0, 99.6, 97.9, 99.5)]                   # 9:45-9:47 pole, no touch
@@ -663,8 +668,9 @@ def _smoke_test() -> int:
     if (
         pf.closed_trades
         and pf.closed_trades[0].exit_reason == "take_profit"
-        and 96.0 <= pf.closed_trades[0].entry_price <= 97.5  # the 9:48 pullback EMA,
-    ):                                                       # NOT a runway-bar touch
+        and abs(pf.closed_trades[0].entry_price - 96.4) < 1e-9  # market fill at the
+        and pf.closed_trades[0].quantity == 10                  # trigger bar's close,
+    ):                                                          # whole shares only
         t = pf.closed_trades[0]
         print(f"PASS entry+TP: {t.symbol} {t.entry_price:.2f} -> {t.exit_price:.2f} "
               f"(+${t.pnl:.2f}), {report.bars_processed} bars")

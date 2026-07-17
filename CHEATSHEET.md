@@ -109,5 +109,5 @@ pkill -INT -f live_runner.py    # graceful stop (flushes trades, flattens positi
 | `--once` / `--smoke` / `--ignore-hours` / `--replay-today` | Single cycle / offline test / run off-hours / replay recent days |
 
 Position sizing, stop, and take-profit are fixed strategy decisions
-($1,000/position, −5% stop, +10% take-profit, max 3 concurrent) — see
-`docs/trading_strategy_baseline.md`.
+(market entry on trigger, whole shares up to $1,000/position, −5% stop,
++10% take-profit, max 3 concurrent) — see `docs/trading_strategy_baseline.md`.
