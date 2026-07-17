@@ -441,8 +441,10 @@ class LiveRunner:
             return 0
 
         # Market entry the moment the trigger confirms: fill at the trigger
-        # bar's close (the last known price when a closed-bar signal fires),
-        # sized to as many WHOLE shares as the position budget allows.
+        # bar's close (the last known price when a closed-bar signal fires)
+        # plus the slippage haircut, sized to as many WHOLE shares as the
+        # position budget allows at the pre-slippage price — like a trader
+        # sizing off the chart and paying the ask.
         entry_price = float(row["Close"])
         quantity = int(self.position_size_usd // entry_price)
         if quantity < 1:
@@ -452,10 +454,15 @@ class LiveRunner:
             quantity=quantity,
             price=entry_price,
             submitted_at=ts.to_pydatetime(),
-            stop_loss=entry_price * (1 - self.stop_pct),
-            take_profit=entry_price * (1 + self.tp_pct),
         )
-        return 1 if order.status is OrderStatus.FILLED else 0
+        if order.status is not OrderStatus.FILLED:
+            return 0
+        # Bracket off the ACTUAL fill — the strategy defines -5%/+10%
+        # "from entry price", and the entry price is what we really paid.
+        position = self.portfolio.positions[symbol]
+        position.stop_loss = order.fill_price * (1 - self.stop_pct)
+        position.take_profit = order.fill_price * (1 + self.tp_pct)
+        return 1
 
     # -- the loop ----------------------------------------------------------
 
@@ -823,6 +830,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Entry-rule set: 'strict' = documented baseline; "
                         "'relaxed' = fast-mover experiment (pole>=2 with dojis, "
                         "pullback 1-3 reds, EMA floor on closes). Default: strict.")
+    p.add_argument("--slippage", type=float, default=0.5, metavar="PCT",
+                   help="Slippage haircut in %% per side on market fills "
+                        "(entries, stops, forced closes). Default: 0.5. "
+                        "At 0.5%%/side the -5%%/+10%% bracket breaks even at "
+                        "~38.6%% wins instead of 33.3%%. 0 = ideal fills.")
     args = p.parse_args(argv)
 
     if args.smoke:
@@ -839,7 +851,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         min_pct_change=args.min_change, min_rvol=args.min_rvol, max_float=args.max_float,
     )
     runner = LiveRunner(
-        portfolio=Portfolio(cash=args.cash),
+        portfolio=Portfolio(cash=args.cash, slippage_pct=args.slippage / 100),
         criteria=criteria,
         trade_log=TradeLog(db_path=args.db, exclusive=True),
         refresh_seconds=args.refresh,

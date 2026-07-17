@@ -90,6 +90,13 @@ class ClosedTrade:
 @dataclass
 class Portfolio:
     cash: float
+    # Slippage haircut, as a FRACTION per side (0.005 = 0.5%). Applied where
+    # the strategy demands immediacy and must cross the spread: market buys
+    # fill that much WORSE (higher), stop-loss and forced-close exits fill
+    # that much WORSE (lower). Limit-style fills — take-profits and resting
+    # limit buys — fill exactly, as real limits do. Default 0 keeps the pure
+    # engine deterministic for tests; the runners opt in.
+    slippage_pct: float = 0.0
     positions: dict[str, Position] = field(default_factory=dict)
     pending_orders: list[Order] = field(default_factory=list)
     closed_trades: list[ClosedTrade] = field(default_factory=list)
@@ -142,17 +149,17 @@ class Portfolio:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
     ) -> Order:
-        """Market entry: fills IMMEDIATELY at `price` (the last known market
-        price — in bar-based simulation, the trigger bar's close). No queue,
-        no waiting for a bar range to cross a limit. Zero slippage is assumed,
-        which is optimistic for thin low-float names; a slippage model can be
-        layered here later without touching callers.
+        """Market entry: fills IMMEDIATELY at `price` plus the slippage
+        haircut (you pay the ask and may walk the book on thin names). In
+        bar-based simulation `price` is the trigger bar's close — the last
+        known price when the signal confirmed.
         """
+        fill_price = price * (1 + self.slippage_pct)
         order = Order(
             symbol=symbol,
             side=Side.BUY,
             quantity=quantity,
-            limit_price=price,  # recorded as the reference price
+            limit_price=price,  # recorded as the pre-slippage reference price
             submitted_at=submitted_at,
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -165,11 +172,11 @@ class Portfolio:
             order.status = OrderStatus.REJECTED
             order.reject_reason = "zero_quantity"
             return order
-        if quantity * price > self.cash:
+        if quantity * fill_price > self.cash:
             order.status = OrderStatus.REJECTED
             order.reject_reason = "insufficient_cash"
             return order
-        self._fill_order(order, price, submitted_at)
+        self._fill_order(order, fill_price, submitted_at)
         return order
 
     def process_bar(self, symbol: str, bar: Bar) -> None:
@@ -181,8 +188,16 @@ class Portfolio:
         if symbol in self.positions:
             pos = self.positions[symbol]
             if pos.stop_loss is not None and bar.low <= pos.stop_loss:
-                self._close_position(symbol, pos.stop_loss, bar.timestamp, "stop_loss")
+                # A triggered stop becomes a market sell: it fills through the
+                # spread, i.e. slippage-worse than the stop price.
+                self._close_position(
+                    symbol,
+                    pos.stop_loss * (1 - self.slippage_pct),
+                    bar.timestamp,
+                    "stop_loss",
+                )
             elif pos.take_profit is not None and bar.high >= pos.take_profit:
+                # A take-profit is a resting limit sell: fills at its price.
                 self._close_position(symbol, pos.take_profit, bar.timestamp, "take_profit")
 
         still_pending: list[Order] = []
@@ -240,13 +255,14 @@ class Portfolio:
     def close_position_at(
         self, symbol: str, price: float, ts: datetime, reason: str
     ) -> Optional[ClosedTrade]:
-        """Force-close an open position at `price` (e.g. end-of-day flatten).
+        """Force-close an open position at `price` less the slippage haircut
+        (a forced close is a market sell — e.g. the end-of-day flatten).
 
         Returns the resulting ClosedTrade, or None if no position is open.
         """
         if symbol not in self.positions:
             return None
-        self._close_position(symbol, price, ts, reason)
+        self._close_position(symbol, price * (1 - self.slippage_pct), ts, reason)
         return self.closed_trades[-1]
 
     def cancel_pending(self, symbol: Optional[str] = None) -> list[Order]:
@@ -295,6 +311,22 @@ def _smoke_test() -> int:
     if abs(pf.equity({}) - expected) > 1e-6:
         print(f"FAIL: expected ${expected:.2f}", file=sys.stderr)
         return 1
+
+    # Slippage haircut: market buy pays up 1%, a triggered stop fills 1%
+    # through the stop price, a take-profit (limit) fills exactly.
+    pf2 = Portfolio(cash=5_000.0, slippage_pct=0.01)
+    o = pf2.submit_market_buy("SLIP", 10, 100.0, t0)
+    if not (abs(o.fill_price - 101.0) < 1e-9 and abs(pf2.cash - 3_990.0) < 1e-9):
+        print(f"FAIL slippage buy: fill={o.fill_price}, cash={pf2.cash}", file=sys.stderr)
+        return 1
+    pf2.positions["SLIP"].stop_loss = 95.0
+    pf2.process_bar("SLIP", Bar(t0, open=96.0, high=96.5, low=94.0, close=94.5))
+    t = pf2.closed_trades[-1]
+    if not (t.exit_reason == "stop_loss" and abs(t.exit_price - 95.0 * 0.99) < 1e-9):
+        print(f"FAIL slippage stop: exit={t.exit_price} ({t.exit_reason})", file=sys.stderr)
+        return 1
+    print(f"Slippage case: buy 100->fill {o.fill_price:.2f}, stop 95->fill {t.exit_price:.2f}: OK")
+
     print("OK")
     return 0
 

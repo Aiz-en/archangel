@@ -43,8 +43,14 @@ enforces them; defaults live in `ScreenCriteria`):
 
 ## Exit Rules
 
-- **Take profit**: +10% from entry price
-- **Stop loss**: -5% from entry price
+- **Take profit**: +10% from entry price (the actual fill)
+- **Stop loss**: -5% from entry price (the actual fill)
+
+> Simulation execution model (2026-07-16): market fills — entries, triggered
+> stops, and forced closes — are charged a **0.5%/side slippage haircut**
+> (tunable via `--slippage`); take-profits fill exactly, as resting limits
+> do. With the haircut, the -5%/+10% bracket breaks even at ~38.6% wins
+> rather than the frictionless 33.3%.
 
 ## Position Sizing
 

@@ -104,6 +104,7 @@ pkill -INT -f live_runner.py    # graceful stop (flushes trades, flattens positi
 | `--db PATH` | SQLite trade log (default `archangel_live.db`) |
 | `--cash USD` | Starting paper cash (default 5000) |
 | `--refresh SECONDS` | Seconds between cycles (default 30) |
+| `--slippage PCT` | Slippage haircut per side on market fills (default 0.5%). At 0.5%/side, breakeven win rate is ~38.6% instead of 33.3% |
 | `--exit-after-close` | Exit after the session instead of idling (for managed runs) |
 | `--no-eod-flatten` | Do not force-close positions before the bell |
 | `--once` / `--smoke` / `--ignore-hours` / `--replay-today` | Single cycle / offline test / run off-hours / replay recent days |

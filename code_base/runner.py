@@ -63,18 +63,21 @@ def run_strategy(
                     ema_9=float(ema_9),
                 ):
                     # Market entry on trigger: fill at the trigger bar's
-                    # close, as many WHOLE shares as the budget allows.
+                    # close plus slippage, as many WHOLE shares as the
+                    # budget allows. Bracket off the actual fill.
                     entry_price = float(row["Close"])
                     quantity = int(position_size_usd // entry_price)
                     if quantity >= 1:
-                        portfolio.submit_market_buy(
+                        order = portfolio.submit_market_buy(
                             symbol=symbol,
                             quantity=quantity,
                             price=entry_price,
                             submitted_at=ts.to_pydatetime(),
-                            stop_loss=entry_price * (1 - stop_pct),
-                            take_profit=entry_price * (1 + tp_pct),
                         )
+                        if order.fill_price is not None:
+                            position = portfolio.positions[symbol]
+                            position.stop_loss = order.fill_price * (1 - stop_pct)
+                            position.take_profit = order.fill_price * (1 + tp_pct)
 
         portfolio.process_bar(
             symbol,

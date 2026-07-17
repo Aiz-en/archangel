@@ -118,7 +118,9 @@ def summarize_history(trade_log: TradeLog, starting_equity: float) -> dict[str, 
 
 def _run_one_sweep(label: str, rank_type: str, threshold: float, max_results: int) -> None:
     starting_equity = 5_000.0
-    pf = Portfolio(cash=starting_equity)
+    # Same slippage haircut the live runner defaults to — backtest numbers
+    # must be comparable to live numbers.
+    pf = Portfolio(cash=starting_equity, slippage_pct=0.005)
     db_path = Path(f"archangel_backtest_{rank_type}.db")
     db_path.unlink(missing_ok=True)
     log = TradeLog(db_path=db_path)
