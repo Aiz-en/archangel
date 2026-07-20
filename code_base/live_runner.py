@@ -11,7 +11,7 @@ historical bars). Every poll cycle it:
      stop-loss / take-profit exits),
   4. checks flat symbols for a bull-flag setup + 9 EMA touch and submits
      entry orders — same rules and same code path as the backtest
-     (strategy.detect_bull_flag_setup / is_9_ema_touch),
+     (strategy.detect_setup / entry_trigger_fires, paired per entry mode),
   5. logs closed trades and equity snapshots to SQLite.
 
 Execution is the LOCAL paper engine: simulated fills against real market
@@ -61,7 +61,7 @@ from market_calendar import is_trading_day, market_close_time
 from paper_engine import Bar, OrderStatus, Portfolio
 from screener import ScreenCriteria, ScreenResult, is_market_open, screen_once
 from storage import TradeLog
-from strategy import ENTRY_MODES, detect_setup, is_9_ema_touch
+from strategy import ENTRY_MODES, detect_setup, entry_trigger_fires
 
 _ET = ZoneInfo("America/New_York")
 
@@ -433,10 +433,19 @@ class LiveRunner:
         ema_9 = row.get("EMA_9")
         if ema_9 is None or pd.isna(ema_9):
             return 0
+        ema_12 = row.get("EMA_12")
+        if ema_12 is None or pd.isna(ema_12):
+            ema_12 = None
+        else:
+            ema_12 = float(ema_12)
         if detect_setup(completed_5m, self.entry_mode) is None:
             return 0
-        if not is_9_ema_touch(
-            bar_low=float(row["Low"]), bar_high=float(row["High"]), ema_9=float(ema_9)
+        if not entry_trigger_fires(
+            self.entry_mode,
+            bar_low=float(row["Low"]),
+            bar_high=float(row["High"]),
+            ema_9=float(ema_9),
+            ema_12=ema_12,
         ):
             return 0
 

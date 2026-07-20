@@ -24,7 +24,7 @@ import pandas as pd
 from ema import fetch_with_ema
 from paper_engine import Bar, Portfolio
 from storage import TradeLog
-from strategy import detect_setup, is_9_ema_touch
+from strategy import detect_setup, entry_trigger_fires
 
 
 def run_strategy(
@@ -56,11 +56,18 @@ def run_strategy(
         if no_position and no_pending and room and len(completed_5m) >= 5:
             ema_9 = row.get("EMA_9")
             if ema_9 is not None and pd.notna(ema_9):
+                ema_12 = row.get("EMA_12")
+                if ema_12 is None or pd.isna(ema_12):
+                    ema_12 = None
+                else:
+                    ema_12 = float(ema_12)
                 setup = detect_setup(completed_5m, mode=entry_mode)
-                if setup is not None and is_9_ema_touch(
+                if setup is not None and entry_trigger_fires(
+                    entry_mode,
                     bar_low=float(row["Low"]),
                     bar_high=float(row["High"]),
                     ema_9=float(ema_9),
+                    ema_12=ema_12,
                 ):
                     # Market entry on trigger: fill at the trigger bar's
                     # close plus slippage, as many WHOLE shares as the

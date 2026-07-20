@@ -27,6 +27,8 @@ venv/
 logs/*
 !logs/.gitkeep
 conf/
+# Cached intraday tapes for analysis/ scripts — bulky, refetchable (~30 days)
+analysis/tape_cache/
 
 # Webull unofficial library — auth/device state and cached credentials
 did.bin

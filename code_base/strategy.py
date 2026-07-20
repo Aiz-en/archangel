@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 
@@ -37,6 +37,7 @@ def detect_bull_flag_setup(
     max_pullback: int = 3,
     ema_col: str = "EMA_12",
     ema_floor: str = "low",
+    floor_scope: str = "window",
     doji_tolerant_pole: bool = False,
 ) -> Optional[BullFlagSetup]:
     """Return a setup if the last bars match the bull-flag pattern, else None.
@@ -48,11 +49,18 @@ def detect_bull_flag_setup(
     exist for the fast-mover experiments (see ENTRY_MODES):
     - ema_floor="close": bodies must hold the EMA but wicks may pierce it
       (violent low-float tapes wick through EMAs on most bars).
+    - floor_scope="pullback": the EMA floor applies to the pullback bars only.
+      On fast movers the pole IS what drags the EMA up, so early pole bars
+      necessarily straddle the lagging EMA (SDOT 2026-07-17: all three pole
+      bars' wicks below EMA_12, the first pole bar's close below it too —
+      a hand-validated setup, rejected by the window-wide floor).
     - doji_tolerant_pole=True: a doji doesn't break the pole run, but the
       pole must still contain at least one true green candle.
     """
     if ema_col not in bars_5m.columns:
         raise ValueError(f"bars_5m missing required column {ema_col!r}")
+    if floor_scope not in ("window", "pullback"):
+        raise ValueError(f"unknown floor_scope {floor_scope!r}")
     if len(bars_5m) < min_pole + min_pullback:
         return None
 
@@ -73,7 +81,10 @@ def detect_bull_flag_setup(
         pole_slice = pole_bar_ok.iloc[-window_size:-pullback_n]
         pole_has_green = is_green.iloc[-window_size:-pullback_n].any()
         pullback_slice = is_red.iloc[-pullback_n:]
-        ema_slice = above_ema.iloc[-window_size:]
+        if floor_scope == "pullback":
+            ema_slice = above_ema.iloc[-pullback_n:]
+        else:
+            ema_slice = above_ema.iloc[-window_size:]
 
         if not (pole_slice.all() and pole_has_green):
             continue
@@ -104,6 +115,13 @@ ENTRY_MODES: dict[str, dict] = {
     "relaxed": dict(
         min_pole=2, min_pullback=1, ema_floor="close", doji_tolerant_pole=True
     ),
+    # From the SDOT 2026-07-17 case study (a trader-annotated tape): baseline
+    # pole/pullback grammar, but the EMA floor moves to the pullback bars only
+    # (close basis) — pole wicks below the lagging EMA are expected on fast
+    # movers. min_pullback=1 so the gate arms while pullback bar 2 is still
+    # forming, matching how the entry is actually timed. Pair with
+    # is_ema_reversal_touch() as the 1m trigger, NOT is_9_ema_touch().
+    "case_study": dict(min_pullback=1, ema_floor="close", floor_scope="pullback"),
 }
 
 
@@ -119,6 +137,50 @@ def detect_setup(bars_5m: pd.DataFrame, mode: str = "strict") -> Optional[BullFl
 def is_9_ema_touch(bar_low: float, bar_high: float, ema_9: float) -> bool:
     """The 1m entry trigger: wick crosses through the 9 EMA value."""
     return bar_low <= ema_9 <= bar_high
+
+
+def is_ema_reversal_touch(
+    bar_low: float,
+    bar_high: float,
+    emas: Iterable[float],
+    tolerance: float = 0.005,
+) -> bool:
+    """Case-study 1m trigger (SDOT 2026-07-17 exercise spec).
+
+    Fires when the bar intersects — or comes within `tolerance` above — ANY of
+    the given EMAs (9 and/or 12): "coming close or intersecting with one of the
+    EMA lines is a strong indicator for a reversal on the pullback." A true
+    touch is NOT required; tolerance is 0.5% for now, subject to change.
+    Bars sitting entirely below an EMA don't fire — the pullback has to reach
+    the EMA from above, not break down through it.
+    """
+    for ema in emas:
+        if bar_low <= ema * (1 + tolerance) and bar_high >= ema:
+            return True
+    return False
+
+
+def entry_trigger_fires(
+    mode: str,
+    bar_low: float,
+    bar_high: float,
+    ema_9: float,
+    ema_12: Optional[float] = None,
+) -> bool:
+    """The mode-paired 1m trigger — the single trigger runners should call.
+
+    strict/relaxed pair with the baseline is_9_ema_touch (EMA 9 wick-through);
+    case_study pairs with is_ema_reversal_touch (either EMA, 0.5% proximity).
+    Keeping the pairing here means live_runner and backtests can never drift
+    apart on which trigger a mode uses. Callers without an EMA_12 value pass
+    None; case_study then tests the 9 EMA alone.
+    """
+    if mode not in ENTRY_MODES:
+        raise ValueError(f"unknown entry mode {mode!r}; choose from {sorted(ENTRY_MODES)}")
+    if mode == "case_study":
+        emas = [ema_9] if ema_12 is None else [ema_9, ema_12]
+        return is_ema_reversal_touch(bar_low, bar_high, emas)
+    return is_9_ema_touch(bar_low, bar_high, ema_9)
 
 
 def _make_bars(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
@@ -213,6 +275,60 @@ def _smoke_test() -> int:
     else:
         print(f"FAIL case 6: strict={strict_hit}, relaxed={relaxed_hit}",
               file=sys.stderr)
+        failures += 1
+
+    # Case 7: SDOT-shaped fast mover — 3-green pole whose wicks dip below the
+    # lagging EMA_12 (first pole bar closes below it too), then 2 reds holding
+    # above on a close basis. strict must reject (window-wide wick floor);
+    # case_study must accept (pullback-only close floor).
+    bars = _make_bars(_RUNWAY + [
+        (95.0, 96.6, 94.9, 96.4),      # green, wick below EMA_12, close below too
+        (96.4, 98.4, 95.3, 98.2),      # green, wick below EMA_12
+        (98.2, 101.0, 98.0, 100.8),    # green
+        (100.8, 101.2, 99.6, 100.0),   # red, close above EMA_12
+        (100.0, 100.4, 98.8, 99.2),    # red, close above EMA_12
+    ])
+    bars = add_ema(bars, [9, 12])
+    strict_hit = detect_setup(bars, mode="strict")
+    cs_hit = detect_setup(bars, mode="case_study")
+    if strict_hit is None and cs_hit is not None:
+        print("PASS case 7: pole-wicks-below-EMA tape — strict rejects, case_study detects")
+    else:
+        print(f"FAIL case 7: strict={strict_hit}, case_study={cs_hit}", file=sys.stderr)
+        failures += 1
+
+    # Case 8: the reversal-touch trigger — near-miss within tolerance fires,
+    # beyond tolerance doesn't, entirely-below-the-EMA doesn't, second EMA counts.
+    checks = [
+        (is_ema_reversal_touch(100.2, 100.8, [100.0]), True, "0.2% above fires"),
+        (is_ema_reversal_touch(100.6, 101.0, [100.0]), False, "0.6% above stays quiet"),
+        (is_ema_reversal_touch(98.0, 99.5, [100.0]), False, "bar fully below stays quiet"),
+        (is_ema_reversal_touch(99.8, 100.4, [100.0]), True, "true intersect fires"),
+        (is_ema_reversal_touch(100.6, 101.0, [100.0, 100.55]), True, "second EMA catches it"),
+    ]
+    if all(got == want for got, want, _ in checks):
+        print("PASS case 8: reversal-touch trigger tolerance behavior")
+    else:
+        for got, want, what in checks:
+            if got != want:
+                print(f"FAIL case 8: {what} (got {got})", file=sys.stderr)
+        failures += 1
+
+    # Case 9: mode->trigger pairing. The same near-miss bar (0.2% above the
+    # 9 EMA, never touching it) must stay quiet under strict's wick-through
+    # trigger and fire under case_study's proximity trigger; unknown modes raise.
+    strict_fire = entry_trigger_fires("strict", 100.2, 100.8, ema_9=100.0)
+    cs_fire = entry_trigger_fires("case_study", 100.2, 100.8, ema_9=100.0)
+    try:
+        entry_trigger_fires("bogus", 100.2, 100.8, ema_9=100.0)
+        raised = False
+    except ValueError:
+        raised = True
+    if (not strict_fire) and cs_fire and raised:
+        print("PASS case 9: mode-paired trigger dispatch")
+    else:
+        print(f"FAIL case 9: strict={strict_fire} case_study={cs_fire} "
+              f"raised={raised}", file=sys.stderr)
         failures += 1
 
     if failures:
