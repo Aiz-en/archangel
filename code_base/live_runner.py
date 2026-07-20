@@ -61,7 +61,7 @@ from market_calendar import is_trading_day, market_close_time
 from paper_engine import Bar, OrderStatus, Portfolio
 from screener import ScreenCriteria, ScreenResult, is_market_open, screen_once
 from storage import TradeLog
-from strategy import ENTRY_MODES, detect_setup, entry_trigger_fires
+from strategy import ENTRY_MODES, detect_setup, entry_trigger_fires, min_bars_for_mode
 
 _ET = ZoneInfo("America/New_York")
 
@@ -428,7 +428,7 @@ class LiveRunner:
             return 0
 
         completed_5m = bars_5m[bars_5m.index <= ts - pd.Timedelta(minutes=5)]
-        if len(completed_5m) < 5:
+        if len(completed_5m) < min_bars_for_mode(self.entry_mode):
             return 0
         ema_9 = row.get("EMA_9")
         if ema_9 is None or pd.isna(ema_9):

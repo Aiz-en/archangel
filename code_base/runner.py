@@ -24,7 +24,7 @@ import pandas as pd
 from ema import fetch_with_ema
 from paper_engine import Bar, Portfolio
 from storage import TradeLog
-from strategy import detect_setup, entry_trigger_fires
+from strategy import detect_setup, entry_trigger_fires, min_bars_for_mode
 
 
 def run_strategy(
@@ -53,7 +53,7 @@ def run_strategy(
         no_pending = not any(o.symbol == symbol for o in portfolio.pending_orders)
         room = len(portfolio.positions) < max_concurrent
 
-        if no_position and no_pending and room and len(completed_5m) >= 5:
+        if no_position and no_pending and room and len(completed_5m) >= min_bars_for_mode(entry_mode):
             ema_9 = row.get("EMA_9")
             if ema_9 is not None and pd.notna(ema_9):
                 ema_12 = row.get("EMA_12")

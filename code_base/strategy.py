@@ -121,7 +121,18 @@ ENTRY_MODES: dict[str, dict] = {
     # movers. min_pullback=1 so the gate arms while pullback bar 2 is still
     # forming, matching how the entry is actually timed. Pair with
     # is_ema_reversal_touch() as the 1m trigger, NOT is_9_ema_touch().
-    "case_study": dict(min_pullback=1, ema_floor="close", floor_scope="pullback"),
+    #
+    # Revised 2026-07-20 on a live ADVB tape: a real EMA touch-and-reverse
+    # (1m trigger fired for both strict and case_study) went untraded because
+    # the day's pole was only 2 true green 5m bars — one short of the
+    # 3-bar minimum this mode still inherited from strict. min_pole drops to
+    # 2; max_pullback widens to 4 (a fast mover's pullback isn't reliably
+    # 1-3 bars either). doji_tolerant_pole stays False — these are real
+    # green/red bars, not dojis.
+    "case_study": dict(
+        min_pole=2, min_pullback=1, max_pullback=4,
+        ema_floor="close", floor_scope="pullback",
+    ),
 }
 
 
@@ -132,6 +143,22 @@ def detect_setup(bars_5m: pd.DataFrame, mode: str = "strict") -> Optional[BullFl
     except KeyError:
         raise ValueError(f"unknown entry mode {mode!r}; choose from {sorted(ENTRY_MODES)}")
     return detect_bull_flag_setup(bars_5m, **params)
+
+
+def min_bars_for_mode(mode: str) -> int:
+    """Fewest closed 5m bars `mode` could possibly detect a setup on.
+
+    Runners short-circuit before calling detect_setup once fewer than this
+    many bars are closed — cheaper than calling in and getting None, and it
+    has to be mode-aware: a hardcoded "5" (strict's own min_pole+min_pullback)
+    silently kept relaxed and case_study waiting for bars they never needed
+    (case_study min_pole=2/min_pullback=1 only needs 3 — caught 2026-07-20 on
+    a live ADVB tape whose setup was checkable at 4 bars but never got asked).
+    """
+    if mode not in ENTRY_MODES:
+        raise ValueError(f"unknown entry mode {mode!r}; choose from {sorted(ENTRY_MODES)}")
+    params = ENTRY_MODES[mode]
+    return params.get("min_pole", 3) + params.get("min_pullback", 2)
 
 
 def is_9_ema_touch(bar_low: float, bar_high: float, ema_9: float) -> bool:
@@ -329,6 +356,57 @@ def _smoke_test() -> int:
     else:
         print(f"FAIL case 9: strict={strict_fire} case_study={cs_fire} "
               f"raised={raised}", file=sys.stderr)
+        failures += 1
+
+    # Case 10: a 2-green pole is now sufficient for case_study (was 3). Both
+    # pole bars' wicks dip below EMA_12 as usual for a fast mover; strict
+    # still requires 3 real greens and also has too few red bars to ever
+    # complete its own pullback, so it rejects regardless.
+    bars = _make_bars(_RUNWAY + [
+        (95.0, 96.6, 94.9, 96.4),   # green pole bar 1, wick below EMA_12
+        (96.4, 98.4, 95.3, 98.2),   # green pole bar 2, wick below EMA_12
+        (98.2, 98.5, 96.5, 97.0),   # red pullback, close above EMA_12
+    ])
+    bars = add_ema(bars, [9, 12])
+    strict_hit = detect_setup(bars, mode="strict")
+    cs_hit = detect_setup(bars, mode="case_study")
+    if strict_hit is None and cs_hit is not None and cs_hit.pole_bars == 2:
+        print("PASS case 10: 2-green pole — strict rejects, case_study detects")
+    else:
+        print(f"FAIL case 10: strict={strict_hit}, case_study={cs_hit}", file=sys.stderr)
+        failures += 1
+
+    # Case 11: a 4-bar red pullback is now accepted for case_study (was
+    # capped at 3). Built so only pullback_n=4 can match — any smaller
+    # suffix pulls a red bar into the pole slot, which must be pure green —
+    # so this genuinely requires the raised ceiling, not a smaller window
+    # that happens to also match. strict caps at 3 and rejects.
+    bars = _make_bars(_RUNWAY + [
+        (100.0, 101.0, 99.5, 100.8),   # green pole bar 1
+        (100.8, 102.5, 100.5, 102.2),  # green pole bar 2
+        (102.2, 102.4, 101.0, 101.3),  # red pullback 1
+        (101.3, 101.5, 100.2, 100.5),  # red pullback 2
+        (100.5, 100.7, 99.3, 99.6),    # red pullback 3
+        (99.6, 99.8, 98.5, 98.8),      # red pullback 4
+    ])
+    bars = add_ema(bars, [9, 12])
+    strict_hit = detect_setup(bars, mode="strict")
+    cs_hit = detect_setup(bars, mode="case_study")
+    if strict_hit is None and cs_hit is not None and cs_hit.pullback_bars == 4:
+        print("PASS case 11: 4-bar red pullback — strict rejects, case_study detects")
+    else:
+        print(f"FAIL case 11: strict={strict_hit}, case_study={cs_hit}", file=sys.stderr)
+        failures += 1
+
+    # Case 12: min_bars_for_mode reflects each mode's own pole+pullback floor,
+    # not a hardcoded constant — this is what runners gate on before ever
+    # calling detect_setup.
+    bar_mins = {m: min_bars_for_mode(m) for m in ("strict", "relaxed", "case_study")}
+    want_mins = {"strict": 5, "relaxed": 3, "case_study": 3}
+    if bar_mins == want_mins:
+        print(f"PASS case 12: min_bars_for_mode {bar_mins}")
+    else:
+        print(f"FAIL case 12: got {bar_mins}, want {want_mins}", file=sys.stderr)
         failures += 1
 
     if failures:
