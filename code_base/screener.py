@@ -63,7 +63,10 @@ class ScreenCriteria:
 
     min_pct_change: float = 70.0          # +70% on the day (the core rule)
     price_min: float = 1.0                 # avoid sub-$1 illiquid junk
-    price_max: float = 20.0                # low-priced parabolic range
+    price_max: float = 35.0                # low-priced parabolic range; raised
+                                           # from 20 on 2026-07-19 (trader call): SDOT's
+                                           # +77% case-study day traded 19.40-30.97
+                                           # and was invisible at the old cap
     min_volume: int = 1_000_000            # absolute liquidity floor (today)
     max_float: float = 20_000_000          # low float <= 20M shares
     min_rvol: float = 5.0                  # today's vol >= 5x average vol

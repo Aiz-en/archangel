@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Started by launchd each weekday morning (see com.archangel.trading.plist.template).
-# Runs the main (+70% strict) and shadow (+30% relaxed, separate DB) live
+# Runs the main (+70% strict) and shadow (+30% case_study, separate DB) live
 # runners until the closing bell, logging under logs/. Both exit on their own
 # after the close (--exit-after-close), or immediately on holidays.
 set -u
@@ -26,12 +26,14 @@ python code_base/live_runner.py --exit-after-close \
     >> "logs/live_$STAMP.log" 2>&1 &
 MAIN_PID=$!
 
-# Shadow = the evidence collector: wider screen AND the relaxed entry
-# grammar (fast-mover experiment). The main runner above stays the strict
-# control. Measured 2026-07-13: relaxed ~30% win rate vs 33.3% breakeven —
-# it runs to build a real sample, not because it has proven edge.
+# Shadow = the evidence collector: wider screen AND the case_study entry
+# grammar from the SDOT 2026-07-17 case-study annotation (EMA floor on pullback
+# closes only, either-EMA 0.5%-proximity trigger). One-week sweep 2026-07-19:
+# 45% WR / +$677 vs the 38.6% breakeven — promising, but it runs to build a
+# live sample, not because edge is proven. Main above stays the strict
+# control. (relaxed ran 2026-07-14..17: 65 trades, -$704 — retired.)
 python code_base/live_runner.py --exit-after-close \
-    --min-change 30 --db archangel_shadow.db --entry-mode relaxed \
+    --min-change 30 --db archangel_shadow.db --entry-mode case_study \
     >> "logs/shadow_$STAMP.log" 2>&1 &
 SHADOW_PID=$!
 
