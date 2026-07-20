@@ -69,10 +69,16 @@ class ScreenCriteria:
                                            # and was invisible at the old cap
     min_volume: int = 1_000_000            # absolute liquidity floor (today)
     max_float: float = 20_000_000          # low float <= 20M shares
-    min_rvol: float = 5.0                  # today's vol >= 5x average vol
+    min_rvol: float = 3.0                  # today's vol >= 3x average vol; lowered
+                                           # from 5x on 2026-07-20 (trader call): GMM
+                                           # cleared every other filter at +59% but sat
+                                           # at 2.8x — yfinance's averageVolume for a
+                                           # recent-history mover bakes in its own prior
+                                           # spike, understating how extreme today
+                                           # actually is relative to a normal baseline
     rank_type: str = "1d"                  # Webull ranking window
     # If a symbol's float / avg-vol can't be fetched, a float<=20M or
-    # rvol>=5x rule can't be evaluated. Drop it rather than let it through.
+    # rvol>=3x rule can't be evaluated. Drop it rather than let it through.
     drop_on_missing_data: bool = True
 
     def describe(self) -> str:
