@@ -3,7 +3,9 @@
 Consumes real market bars (e.g., from yfinance) and simulates order fills
 locally. Fill model is limit-style: a pending order at price X fills on a
 bar if `bar.low <= X <= bar.high`. Stop-loss and take-profit on open
-positions are checked against the same OHLC range.
+positions are checked against the same OHLC range — except the bar a
+position was entered on, whose low/high already happened before the entry
+fill (see `process_bar`).
 
 The Portfolio is intentionally strategy-agnostic. It owns cash, positions,
 and order state; it does NOT enforce strategy rules like max-concurrent
@@ -185,7 +187,14 @@ class Portfolio:
         # alone can't tell us which printed first. Assume stop fills first —
         # the conservative (worse-for-PnL) choice, matches typical backtest
         # convention.
-        if symbol in self.positions:
+        #
+        # A position is never checked against stop/tp on the SAME bar it was
+        # entered on: entry fills at that bar's close, so the bar's low/high
+        # already happened chronologically before the fill — a position can't
+        # be stopped out by a price that printed before it existed. Caught
+        # 2026-07-20 on a real live trade (ADVB): entered on a bar's close,
+        # immediately "stopped out" by that same bar's own low.
+        if symbol in self.positions and self.positions[symbol].entry_time != bar.timestamp:
             pos = self.positions[symbol]
             if pos.stop_loss is not None and bar.low <= pos.stop_loss:
                 # A triggered stop becomes a market sell: it fills through the
@@ -320,12 +329,30 @@ def _smoke_test() -> int:
         print(f"FAIL slippage buy: fill={o.fill_price}, cash={pf2.cash}", file=sys.stderr)
         return 1
     pf2.positions["SLIP"].stop_loss = 95.0
-    pf2.process_bar("SLIP", Bar(t0, open=96.0, high=96.5, low=94.0, close=94.5))
+    t1 = datetime(2026, 4, 28, 9, 35)
+    pf2.process_bar("SLIP", Bar(t1, open=96.0, high=96.5, low=94.0, close=94.5))
     t = pf2.closed_trades[-1]
     if not (t.exit_reason == "stop_loss" and abs(t.exit_price - 95.0 * 0.99) < 1e-9):
         print(f"FAIL slippage stop: exit={t.exit_price} ({t.exit_reason})", file=sys.stderr)
         return 1
     print(f"Slippage case: buy 100->fill {o.fill_price:.2f}, stop 95->fill {t.exit_price:.2f}: OK")
+
+    # Same-bar entry/exit: a position must NOT be checked against its own
+    # stop/tp on the bar it was entered on (that bar's low/high already
+    # happened before the close it was entered at). The very next bar with
+    # the same breach DOES trigger — the guard is scoped to the entry bar only.
+    pf3 = Portfolio(cash=5_000.0)
+    pf3.submit_market_buy("SAMEBAR", 10, 100.0, t0)
+    pf3.positions["SAMEBAR"].stop_loss = 95.0
+    pf3.process_bar("SAMEBAR", Bar(t0, open=99.0, high=101.0, low=90.0, close=100.0))
+    if "SAMEBAR" not in pf3.positions or pf3.closed_trades:
+        print(f"FAIL same-bar guard: position closed by its own entry bar's low", file=sys.stderr)
+        return 1
+    pf3.process_bar("SAMEBAR", Bar(t1, open=99.0, high=99.5, low=90.0, close=91.0))
+    if "SAMEBAR" in pf3.positions or not pf3.closed_trades:
+        print(f"FAIL same-bar guard: next bar should have triggered the stop", file=sys.stderr)
+        return 1
+    print(f"Same-bar guard: entry bar's low (90.0) ignored; next bar's low (90.0) triggers stop_loss: OK")
 
     print("OK")
     return 0
