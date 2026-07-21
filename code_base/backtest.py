@@ -42,6 +42,7 @@ def backtest(
     portfolio: Portfolio,
     period: str = "5d",
     trade_log: Optional[TradeLog] = None,
+    entry_mode: str = "strict",
 ) -> dict[str, Any]:
     per_symbol: dict[str, dict[str, Any]] = {}
     for sym in symbols:
@@ -50,7 +51,9 @@ def backtest(
         # portfolio, which is misleading when reading per-symbol results.
         trades_before = len(portfolio.closed_trades)
         try:
-            full = fetch_and_run(sym, portfolio, period=period, trade_log=trade_log)
+            full = fetch_and_run(
+                sym, portfolio, period=period, trade_log=trade_log, entry_mode=entry_mode
+            )
         except Exception as exc:
             per_symbol[sym] = {"error": f"{type(exc).__name__}: {exc}"}
             continue
